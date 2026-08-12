@@ -1,0 +1,60 @@
+# Ref: https://github.com/DavidAnson/markdownlint/blob/main/schema/.markdownlint.yaml
+
+default: true
+extends: null
+
+# Unordered list indentation
+# https://github.com/DavidAnson/markdownlint/blob/v0.41.1/doc/md007.md
+MD007:
+  indent: 4
+
+# Multiple consecutive blank lines
+# https://github.com/DavidAnson/markdownlint/blob/v0.41.1/doc/md012.md
+MD012:
+  maximum: 2
+
+# Line length
+# https://github.com/DavidAnson/markdownlint/blob/v0.41.1/doc/md013.md
+MD013: false
+#   line_length: 120
+#   heading_line_length: 120
+#   code_block_line_length: 120
+
+# Headings should be surrounded by blank lines
+# https://github.com/DavidAnson/markdownlint/blob/v0.41.1/doc/md022.md
+MD022:
+  lines_above: 2
+
+# Blank line inside blockquote
+# https://github.com/DavidAnson/markdownlint/blob/v0.41.1/doc/md028.md
+MD028: true
+
+# Inline HTML
+# https://github.com/DavidAnson/markdownlint/blob/v0.41.1/doc/md033.md
+MD033:
+  allowed_elements: ['kbd']
+
+# Bare URL used
+# https://github.com/DavidAnson/markdownlint/blob/v0.41.1/doc/md034.md
+MD034: false
+
+# Required heading structure
+# https://github.com/DavidAnson/markdownlint/blob/v0.41.1/doc/md043.md
+# This can't currently be constrained to specific file or glob patterns.
+# Ref: https://github.com/DavidAnson/markdownlint/issues/666#issuecomment-5270484091
+# MD043:
+#   headings:
+#     - '?'
+#     - "*"
+#     - '## Requirements (optional)'
+#     - "*"
+#     - '## Installation (optional)'
+#     - "*"
+#     - '## Configuration (optional)'
+#     - "*"
+#     - '## Usage (optional)'
+#     - "*"
+#     - '## Contributing (optional)'
+#     - "*"
+#     - '## License'
+#     - '## Copyright'
