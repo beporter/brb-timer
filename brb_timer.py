@@ -36,24 +36,25 @@ requests_log.setLevel(logging.DEBUG)
 requests_log.propagate = True
 
 try:
-    import obspython as obs
+    import obspython as obs # type: ignore
 except ImportError:
     logging.debug('obs module import failed.')
 
-###############################################################################
+
+###########################################################################
 # Constants
-###############################################################################
+###########################################################################
 
 SCRIPT_NAME = "BRB Timer"
 TEXT_SOURCE_NAME = SCRIPT_NAME
 
-# ============================================================================
+# =========================================================================
 # OBS Settings Defaults
 
 DEFAULT_BOT_USERNAME = "BRBot"
 DEFAULT_AUTO_HIDE_SECONDS = 120
 
-# ============================================================================
+# =========================================================================
 # Chat Commands and Messages
 
 CMD_BRB = "!brb"
@@ -64,27 +65,16 @@ MSG_ONLY_MOD_START = f"Only mods can start a {CMD_BRB}."
 MSG_ONLY_MOD_END = f"Only mods can end a {CMD_BRB} with {CMD_BACK}."
 MSG_BRB_STARTED = (
     "{streamer} is taking a break! "
-    "Guess how long till they're back (without going over!)"
+    "Guess how long till they're back (without going over!) "
     "Type `{CMD_AT} MM:SS` in chat!"
 )
-MSG_ALREADY_RUNNING = (
-    f"{CMD_BRB} is already running! Must use {CMD_BACK} first."
-)
-MSG_GUESS_ACCEPTED = (
-    "{user} guesses {guess}."
-)
-MSG_ALREADY_GUESSED = (
-    "{user} already guessed {guess}. "
-    "You can't change your guess!"
-)
-MSG_NO_BRB = (
-    f"There's no {CMD_BRB} running. A mod must use {CMD_BRB} first."
-)
-MSG_BRB_FINISHED = (
-    "{streamer} is back! Winner is: {winner}"
-)
+MSG_ALREADY_RUNNING = f"{CMD_BRB} is already running! Must use {CMD_BACK} first."
+MSG_GUESS_ACCEPTED = "{user} guesses {guess}."
+MSG_ALREADY_GUESSED = "{user} already guessed {guess}. You can't change your guess!"
+MSG_NO_BRB = (f"There's no {CMD_BRB} running. A mod must use {CMD_BRB} first.")
+MSG_BRB_FINISHED = ("{streamer} is back! Winner is: {winner}")
 
-# ============================================================================
+# =========================================================================
 # Twitch OAuth
 
 # BRB Timer for Chat
@@ -98,7 +88,7 @@ TWITCH_REDIRECT_HOST = "127.0.0.1"
 TWITCH_REDIRECT_PORT = 8765 # TODO: This needs to be dynamic based on availability.
 TWITCH_REDIRECT_PATH = "/oauth/callback"
 TWITCH_REDIRECT_URI = (
-    f"http://{REDIRECT_HOST}:{REDIRECT_PORT}{REDIRECT_PATH}"
+    f"http://{TWITCH_REDIRECT_HOST}:{TWITCH_REDIRECT_PORT}{TWITCH_REDIRECT_PATH}"
 )
 
 TWITCH_AUTHORIZE_URL = "https://id.twitch.tv/oauth2/authorize"
@@ -145,7 +135,7 @@ TWITCH_OAUTH_SCOPES = [
     # "user:write:chat",
 ]
 
-CALLBACK_HTML = r"""
+TWITCH_CALLBACK_HTML = r"""
 <!DOCTYPE html>
 <html lang="en-US">
 <head>
@@ -161,8 +151,7 @@ CALLBACK_HTML = r"""
         const status = document.getElementById("status");
 
         try {
-            // Twitch implicit grant puts the OAuth response in the
-            // URL fragment, not the query string.
+            // Twitch implicit grant puts the OAuth response in the URL fragment, not the query string.
             const fragment = window.location.hash.substring(1);
 
             if (!fragment) {
@@ -208,13 +197,15 @@ CALLBACK_HTML = r"""
 """
 
 
-###############################################################################
+###########################################################################
 # Script State Storage
-###############################################################################
+###########################################################################
 
 class BRBState:
     """
     Holds the current BRB session state.
+
+    That includes whether a !brb is running, what chatters have guessed, and who the most recent winner is.
 
     State machine:
 
@@ -266,9 +257,9 @@ class BRBState:
         renderer.hide()
 
 
-###############################################################################
+###########################################################################
 # Chat Message Data Container
-###############################################################################
+###########################################################################
 
 @dataclass
 class ChatMessage:
@@ -279,9 +270,9 @@ class ChatMessage:
     is_broadcaster: bool
 
 
-###############################################################################
+###########################################################################
 # Twitch IRC Client
-###############################################################################
+###########################################################################
 
 class TwitchIRCClient:
     """
@@ -332,7 +323,7 @@ class TwitchIRCClient:
         self.thread = threading.Thread(
             target=self.receive_loop,
             daemon=True,
-            name="BRBTimer-TwitchIRC",
+            name=f"{SCRIPT_NAME}-TwitchIRC",
         )
 
         self.thread.start()
@@ -351,17 +342,9 @@ class TwitchIRCClient:
     #######################################################################
 
     def connect(self):
-        raw = socket.create_connection(
-            (self.HOST, self.PORT),
-            timeout=15,
-        )
+        raw = socket.create_connection((self.HOST, self.PORT), timeout=15)
         ctx = ssl.create_default_context()
-
-        self.socket = ctx.wrap_socket(
-            raw,
-            server_hostname=self.HOST,
-        )
-
+        self.socket = ctx.wrap_socket(raw, server_hostname=self.HOST)
         self.reader = self.socket.makefile(
             "r",
             encoding="utf-8",
@@ -385,14 +368,13 @@ class TwitchIRCClient:
                 self.connect()
                 while self.running:
                     line = self.reader.readline()
-
                     if not line:
                         raise ConnectionError("EOF")
 
                     self.handle_line(line.rstrip())
 
             except Exception as ex:
-                print(f"TwitchIRC: {ex}")
+                self._log(f"TwitchIRC: {ex}", obs.WARNING)
                 try:
                     if self.socket:
                         self.socket.close()
@@ -405,24 +387,18 @@ class TwitchIRCClient:
 
     def send_raw(self, line: str):
         with self.send_lock:
-            self.socket.sendall(
-                (line + "\r\n").encode("utf-8")
-            )
+            self.socket.sendall((line + "\r\n").encode("utf-8"))
 
     #######################################################################
 
     def send_chat(self, message: str):
-        self.send_raw(
-            f"PRIVMSG #{self.channel} :{message}"
-        )
+        self.send_raw(f"PRIVMSG #{self.channel} :{message}")
 
     #######################################################################
 
     def handle_line(self, line: str):
         if line.startswith("PING"):
-            self.send_raw(
-                line.replace("PING", "PONG", 1)
-            )
+            self.send_raw(line.replace("PING", "PONG", 1))
 
             return
 
@@ -430,23 +406,16 @@ class TwitchIRCClient:
             return
 
         msg = self.parse_privmsg(line)
-
         if msg:
             self.callback(ChatMessage(msg))
 
     #######################################################################
 
-    def parse_privmsg(
-        self,
-        line: str,
-    ) -> Optional[ChatMessage]:
-
+    def parse_privmsg(self, line: str) -> Optional[ChatMessage]:
         try:
             tags_raw, remainder = line.split(" ", 1)
-            tags = self.parse_tags(
-                tags_raw[1:]
-            )
-            prefix, command, channel, message = (
+            tags = self.parse_tags(tags_raw[1:])
+            prefix, _command, _channel, message = (
                 remainder.split(" ", 3)
             )
             username = prefix[1:].split("!")[0]
@@ -454,21 +423,10 @@ class TwitchIRCClient:
 
             return ChatMessage(
                 username=username,
-                display_name=tags.get(
-                    "display-name",
-                    username,
-                ),
+                display_name=tags.get("display-name", username),
                 message=message,
-                is_mod=(
-                    tags.get("mod") == "1"
-                ),
-                is_broadcaster=(
-                    "broadcaster/1"
-                    in tags.get(
-                        "badges",
-                        "",
-                    )
-                ),
+                is_mod=(tags.get("mod") == "1"),
+                is_broadcaster=("broadcaster/1" in tags.get("badges", "")),
             )
 
         except Exception:
@@ -487,18 +445,20 @@ class TwitchIRCClient:
 
         return result
 
+    #######################################################################
+
+    @staticmethod
+    def _log(self, message, level = obs.LOG_ERROR):
+        obs.script_log(level, f"[{self.__class__.__name__}] {message}")
 
 
-
-
-
-###############################################################################
+###########################################################################
 # Source Generator (Text Source with show/hide scene_item transitions)
-###############################################################################
+###########################################################################
 
 class SourceGenerator:
     """
-    Creates a text source in the currently active OBS scene if it does not
+    Creates an OBS text source in the currently active OBS scene if it does not
     already exist.
 
     The generated source:
@@ -510,8 +470,10 @@ class SourceGenerator:
       - Is saved through OBS's normal source-saving mechanism
     """
 
-    SHOW_TRANSITION_TYPE = "fade_transition"
-    HIDE_TRANSITION_TYPE = "fade_transition"
+    SHOW_TRANSITION_TYPE = "slide_transition"
+    HIDE_TRANSITION_TYPE = "slide_transition"
+    SHOW_TRANSITION_DIR = "left"
+    HIDE_TRANSITION_DIR = "right"
     TRANSITION_DURATION_MS = 300
 
     def __init__(
@@ -538,14 +500,16 @@ class SourceGenerator:
         else:
             self.text_source_ids = [text_source_id]
 
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------------------
     # Public API
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+
+    #######################################################################
 
     @staticmethod
     def source_exists(self, source_name):
         """
-        Returns True if a source with self.source_name is already present
+        Returns True if a source with source_name is already present
         in the currently active scene.
         """
         scene_source = obs.obs_frontend_get_current_scene()
@@ -563,12 +527,95 @@ class SourceGenerator:
                 return False
 
             # Might need to switch to the `_recursive` variant.
-            item = obs.obs_scene_find_source(scene, self.source_name)
+            item = obs.obs_scene_find_source(scene, source_name)
 
             return item is not None
 
         finally:
             obs.obs_source_release(scene_source)
+
+    #######################################################################
+
+    @contextmanager
+    def _create_source(self):
+        """
+        If we're provided a text_source_name that doesn't exist in the active scene, create one and add it in using some defaults for the OBS user to subsequently tweak.
+
+        Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5a57/src/add_nested.py#L16
+        Ref: https://github.com/obsproject/obs-studio/blob/32.0.4/plugins/text-freetype2/text-freetype2.c#L170
+        """
+
+        with self._data_ar() as settings:
+            obs.obs_data_set_string(settings, "text", self.cached_text)
+            obs.obs_data_set_bool(settings, "outline", True)
+            obs.obs_data_set_bool(settings, "drop_shadow", False)
+            # Ref: https://docs.obsproject.com/reference-properties#c.obs_properties_add_color_alpha
+            obs.obs_data_set_int(settings, "color1", 0xffffff00) # Format: 0xrrggbbaa
+            obs.obs_data_set_int(settings, "color2", 0xffffff00)
+
+            with self._data_ar() as font:
+                obs.obs_data_set_string(font, "face", "Monaco")
+                obs.obs_data_set_string(font, "style", "Regular")
+                obs.obs_data_set_int(font, "size", 256)
+                obs.obs_data_set_int(font, "flags", 0)
+
+                obs.obs_data_set_obj(settings, "font", font)
+
+                try:
+                    source = obs.obs_source_create(uuid.uuid4(), self.text_source_name, settings, None)
+                    obs.obs_save_source(source)
+
+                    current_scene = obs.obs_frontend_get_current_scene()
+                    obs.obs_scene_add(current_scene, source)
+                finally:
+                    obs.obs_source_release(source)
+                    obs.obs_scene_release(current_scene)
+
+
+        # Ref: https://github.com/obsproject/obs-studio/blob/32.0.4/libobs/obs.h#L153
+        scene_item = obs.obs_scene_find_source(scene, self.text_source_name)
+        if scene_item:
+            obs.obs_sceneitem_set_pos(scene_item, obs.vec2(0, 0)) # top-left TODO: Change to top-right
+
+            obs.obs_sceneitem_set_order(scene_item, obs.OBS_ORDER_MOVE_TOP) # layer on top
+
+            obs.obs_sceneitem_set_bounds_type(scene_item, obs.OBS_BOUNDS_SCALE_TO_WIDTH)
+            obs.obs_sceneitem_set_bounds_alignment(scene_item, obs.OBS_ALIGN_CENTER)
+            obs.obs_sceneitem_set_bounds(scene_item, obs.vec2(400, 100))
+
+            # TODO: Need to create a new source for each transition. Ref: obs.OBS_SOURCE_TYPE_TRANSITION
+            show_transition = obs.TODO()
+            obs.obs_source_set(show_transition, TODO)
+
+            obs.obs_sceneitem_set_transition(scene_item, True, TODO) # True = the "show" transition
+            obs.obs_sceneitem_set_transition_duration(scene_item, True, 300) # ms
+
+
+            obs.obs_sceneitem_set_transition(scene_item, False, TODO) # False = the "hide" transition
+
+            obs.obs_sceneitem_release(scene_item)
+
+
+                # "show_transition": {
+                #     "id": "slide_transition",
+                #     "versioned_id": "slide_transition",
+                #     "name": "example_text_source Show Transition",
+                #     "transition": {
+                #         "direction": "left"
+                #     },
+                #     "duration": 300
+                # },
+                # "hide_transition": {
+                #     "id": "slide_transition",
+                #     "versioned_id": "slide_transition",
+                #     "name": "example_text_source Hide Transition",
+                #     "transition": {
+                #         "direction": "right"
+                #     },
+                #     "duration": 300
+                # },
+
+    #######################################################################
 
     @staticmethod
     def create(self, source_name):
@@ -734,9 +781,11 @@ class SourceGenerator:
             if scene_source is not None:
                 obs.obs_source_release(scene_source)
 
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------------------
     # Internal helpers
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+
+    #######################################################################
 
     def _create_text_source(self):
         """
@@ -775,136 +824,6 @@ class SourceGenerator:
         finally:
             obs.obs_data_release(settings)
 
-    @staticmethod
-    def _log(message, level = obs.LOG_ERROR):
-        level = DEBUG
-        obs.script_log(
-            level,
-            "[SourceGenerator] %s" % message
-        )
-
-
-# ----------------------------------------------------------------------
-# Example OBS script hook
-# ----------------------------------------------------------------------
-
-SOURCE_NAME = "My Generated Text"
-
-
-def script_load(settings):
-    # (other existing tasks here)
-
-
-
-
-###############################################################################
-# Timer Renderer
-###############################################################################
-
-class TimerRenderer:
-    """
-    This class handles the OBS display of the on-screen timer.
-
-    It requires the obspython module loaded as `obs`.
-    """
-
-    def __init__(self):
-        self.text_source_name = ""
-        self.visible = False
-        self.cached_text = ""
-
-    ###########################################################################
-
-    def configure(self, source_name: str):
-        """
-        Called from script_update() whenever the user changes settings.
-        """
-
-        self.text_source_name = source_name
-        if not self.exists():
-            self.create_source()
-
-    ###########################################################################
-
-    @contextmanager
-    def _create_source(self):
-        """
-        If we're provided a text_source_name that doesn't exist in the active scene, create one and add it in using some defaults for the OBS user to subsequently tweak.
-
-        Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5a57/src/add_nested.py#L16
-        Ref: https://github.com/obsproject/obs-studio/blob/32.0.4/plugins/text-freetype2/text-freetype2.c#L170
-        """
-
-        with self._data_ar() as settings:
-            obs.obs_data_set_string(settings, "text", self.cached_text)
-            obs.obs_data_set_bool(settings, "outline", True)
-            obs.obs_data_set_bool(settings, "drop_shadow", False)
-            # Ref: https://docs.obsproject.com/reference-properties#c.obs_properties_add_color_alpha
-            obs.obs_data_set_int(settings, "color1", 0xffffff00) # Format: 0xrrggbbaa
-            obs.obs_data_set_int(settings, "color2", 0xffffff00)
-
-            with self._data_ar() as font:
-                obs.obs_data_set_string(font, "face", "Monaco")
-                obs.obs_data_set_string(font, "style", "Regular")
-                obs.obs_data_set_int(font, "size", 256)
-                obs.obs_data_set_int(font, "flags", 0)
-
-                obs.obs_data_set_obj(settings, "font", font)
-
-                try:
-                    source = obs.obs_source_create(uuid.uuid4(), self.text_source_name, settings, None)
-                    obs.obs_save_source(source)
-
-                    current_scene = obs.obs_frontend_get_current_scene()
-                    obs.obs_scene_add(current_scene, source)
-                finally:
-                    obs.obs_source_release(source)
-                    obs.obs_scene_release(current_scene)
-
-
-        # Ref: https://github.com/obsproject/obs-studio/blob/32.0.4/libobs/obs.h#L153
-        scene_item = obs.obs_scene_find_source(scene, self.text_source_name)
-        if scene_item:
-            obs.obs_sceneitem_set_pos(scene_item, obs.vec2(0, 0)) # top-left TODO: Change to top-right
-
-            obs.obs_sceneitem_set_order(scene_item, obs.OBS_ORDER_MOVE_TOP) # layer on top
-
-            obs.obs_sceneitem_set_bounds_type(scene_item, obs.OBS_BOUNDS_SCALE_TO_WIDTH)
-            obs.obs_sceneitem_set_bounds_alignment(scene_item, obs.OBS_ALIGN_CENTER)
-            obs.obs_sceneitem_set_bounds(scene_item, obs.vec2(400, 100))
-
-            # TODO: Need to create a new source for each transition. Ref: obs.OBS_SOURCE_TYPE_TRANSITION
-            show_transition = obs.TODO()
-            obs.obs_source_set(show_transition, TODO)
-
-            obs.obs_sceneitem_set_transition(scene_item, True, TODO) # True = the "show" transition
-            obs.obs_sceneitem_set_transition_duration(scene_item, True, 300) # ms
-
-
-            obs.obs_sceneitem_set_transition(scene_item, False, TODO) # False = the "hide" transition
-
-            obs.obs_sceneitem_release(scene_item)
-
-
-                # "show_transition": {
-                #     "id": "slide_transition",
-                #     "versioned_id": "slide_transition",
-                #     "name": "example_text_source Show Transition",
-                #     "transition": {
-                #         "direction": "left"
-                #     },
-                #     "duration": 300
-                # },
-                # "hide_transition": {
-                #     "id": "slide_transition",
-                #     "versioned_id": "slide_transition",
-                #     "name": "example_text_source Hide Transition",
-                #     "transition": {
-                #         "direction": "right"
-                #     },
-                #     "duration": 300
-                # },
-
     ###########################################################################
 
     @contextmanager
@@ -917,23 +836,6 @@ class TimerRenderer:
             yield settings
         finally:
             obs.obs_data_release(settings)
-
-    ###########################################################################
-
-    def add_random_text_source(self, scene):
-        """
-        Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference#add-scene-with-sources-to-current-scene
-        """
-        r = " random text # " + str(randint(0, 10))
-        with self._data_ar() as settings:
-            S.obs_data_set_string(settings, "text", f"random text value {r}")
-            with source_create_ar("text_ft2_source", f"random text{r}", settings) as source:
-                pos = S.vec2()
-                pos.x = randint(0, 1920)
-                pos.y = randint(0, 1080)
-                scene_item = S.obs_scene_add(scene, source)
-                S.obs_sceneitem_set_pos(scene_item, pos)
-
 
     ###########################################################################
 
@@ -965,7 +867,61 @@ class TimerRenderer:
         finally:
             obs.obs_source_release(source)
 
-    ###########################################################################
+    #######################################################################
+
+    @staticmethod
+    def _log(self, message, level = obs.LOG_ERROR):
+        obs.script_log(level, f"[{self.__class__.__name__}] {message}")
+
+
+
+###########################################################################
+# Timer Renderer
+###########################################################################
+
+class TimerRenderer:
+    """
+    This class handles the OBS display of the on-screen timer.
+
+    It requires the obspython module loaded as `obs`.
+    """
+
+    def __init__(self):
+        self.text_source_name = ""
+        self.visible = False
+        self.cached_text = ""
+
+    #######################################################################
+
+    def configure(self, source_name: str):
+        """
+        Called from script_update() whenever the user changes settings.
+        """
+
+        self.text_source_name = source_name
+        if not self.exists():
+            self.create_source()
+
+    #######################################################################
+
+
+    def add_random_text_source(self, scene): # TODO: Remove this example method
+        """
+        Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference#add-scene-with-sources-to-current-scene
+        """
+        r = " random text # " + str(randint(0, 10))
+        with self._data_ar() as settings:
+            S.obs_data_set_string(settings, "text", f"random text value {r}")
+            with source_create_ar("text_ft2_source", f"random text{r}", settings) as source:
+                pos = S.vec2()
+                pos.x = randint(0, 1920)
+                pos.y = randint(0, 1080)
+                scene_item = S.obs_scene_add(scene, source)
+                S.obs_sceneitem_set_pos(scene_item, pos)
+
+
+
+    ######################################################################
 
     def exists(self) -> bool:
         with self._get_source() as s:
@@ -973,7 +929,7 @@ class TimerRenderer:
 
         return exists
 
-    ###########################################################################
+    #######################################################################
 
     def toggle(self):
         """
@@ -991,19 +947,19 @@ class TimerRenderer:
 
         return toggled
 
-    ###########################################################################
+    #######################################################################
 
     def show(self):
         self.visible = True
         self._apply_text(self.cached_text)
 
-    ###########################################################################
+    #######################################################################
 
     def hide(self):
         self.visible = False
         self._apply_text("")
 
-    ###########################################################################
+    #######################################################################
 
     def set_text(self, text: str):
         self.cached_text = text
@@ -1011,13 +967,13 @@ class TimerRenderer:
         if self.visible:
             self._apply_text(text)
 
-    ###########################################################################
+    #######################################################################
 
     def clear(self):
         self.cached_text = ""
         self.hide()
 
-    ###########################################################################
+    #######################################################################
 
     def _apply_text(self, text: str):
         if not self.text_source_name:
@@ -1049,27 +1005,36 @@ class TimerRenderer:
             obs.obs_source_release(source)
 
 
-###############################################################################
+###########################################################################
 # Guess Manager
-###############################################################################
+###########################################################################
 
 class GuessManager:
     def __init__(self, state: BRBState):
         self.state = state
 
     def clear(self) -> None:
-        raise NotImplementedError
+        self.state = None
 
     def add_guess(self, username: str, seconds: int) -> bool:
-        raise NotImplementedError
+        if username not in self.state.guesses.keys:
+            self.state.guesses[username] = seconds
+
+            return True
+
+        return False
 
     def find_winner(self, actual_seconds: int):
-        raise NotImplementedError
+        qualified = dict(filter(lambda secs: secs <= actual_seconds, self.state.guesses.items()))
+        dict(sorted(qualified.items(), key=lambda secs: secs))
+        winner = qualified.keys()[-1]
+
+        return winner
 
 
-###############################################################################
-# Guess Manager
-###############################################################################
+###########################################################################
+# Twitch API Wrapper
+###########################################################################
 
 # https://dev.twitch.tv/console/apps/ja5swzyzsr1euwm0e53h1sxqhk553l
 # Personal BRBTimer OAuth Client ID: ja5swzyzsr1euwm0e53h1sxqhk553l
@@ -1178,10 +1143,14 @@ class TwitchApi:
         self.client_id = client_id
         self.token = token
 
+    #######################################################################
+
     def user(self, username):
         resp = self.get('helix/users', {'login': username})
 
         return resp
+
+    #######################################################################
 
     def validate(self):
         resp = self.get('oauth2/validate')
@@ -1208,10 +1177,14 @@ class TwitchApi:
         # client_id = "YOUR_CLIENT_ID"
         # user_id = "USER_ID_FROM_VALIDATE"
 
+    #######################################################################
+
     def channel(self, broadcaster_id):
         raise NotImplementedError
 
         req = self.get('helix/channels', {'broadcaster_id': broadcaster_id}) # https://api.twitch.tv/helix/streams?user_login=$user&type=live&first=1
+
+    #######################################################################
 
     def moderators(self):
         raise NotImplementedError
@@ -1245,6 +1218,8 @@ class TwitchApi:
             for mod in moderators:
                 print(" ", mod["user_login"])
 
+    #######################################################################
+
     def get(self, path, params = {}, extra_headers = {}):
         server = self.server(path)
         url = f"{server}/{path}?" + urllib.parse.urlencode(params)
@@ -1268,12 +1243,16 @@ class TwitchApi:
             logging.debug(e)
         return False
 
+    #######################################################################
+
     def server(self, path):
         match path.split('/', 2)[0]:
             case 'oauth2':
                 return 'https://id.twitch.tv'
             case _:
                 return 'https://api.twitch.tv'
+
+    #######################################################################
 
     def headers(self, extra = {}):
         return {
@@ -1285,48 +1264,48 @@ class TwitchApi:
 
 
 
-
-###############################################################################
+###########################################################################
 # HTTP server
-###############################################################################
+###########################################################################
 
 class TwitchOAuthHandler(http.server.BaseHTTPRequestHandler):
 
+    #######################################################################
+
+    def setCallback(self, callback: Callable) -> None:
+        """
+        Give ourselves a way of sending data back to BRBScript when we successfully process a POST submission containing our OAuth details.
+        """
+        self.callback = callback
+
+    #######################################################################
+
+    def setServer(self, server) -> None:
+        """
+        This non-standard hook lets us shut our own parent http server down after successful POST processing.
+        """
+        self.server = server
+
+    #######################################################################
+
     def do_GET(self):
         """
-        Handles the Twitch redirect.
+        Handles the successful Twitch OAuth redirect payload.
 
-        IMPORTANT:
-        The Twitch access token is in the URL fragment, so it is NOT
-        available here. We return HTML containing JavaScript that reads
-        window.location.hash and POSTs it back to us.
+        The Twitch auth token is passed in the URL _fragment_, so it is NOT
+        available here. We return an HTML payload containing JavaScript
+        that reads window.location.hash and POSTs it back to us.
         """
 
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != TWITCH_REDIRECT_PATH:
+            self.respond(404, "text/html; charset=utf-8", "<h1>Not found.</h1>")
 
-        if parsed.path != REDIRECT_PATH:
-            self.send_response(404)
-            self.end_headers()
             return
 
-        body = CALLBACK_HTML.encode("utf-8")
+        self.respond(200, "text/html; charset=utf-8", TWITCH_CALLBACK_HTML.encode("utf-8"))
 
-        self.send_response(200)
-        self.send_header(
-            "Content-Type",
-            "text/html; charset=utf-8"
-        )
-        self.send_header(
-            "Content-Length",
-            str(len(body))
-        )
-        self.send_header(
-            "Cache-Control",
-            "no-store"
-        )
-        self.end_headers()
-
-        self.wfile.write(body)
+    #######################################################################
 
     def do_POST(self):
         """
@@ -1335,77 +1314,67 @@ class TwitchOAuthHandler(http.server.BaseHTTPRequestHandler):
         """
 
         parsed = urllib.parse.urlparse(self.path)
-
         if parsed.path != "/oauth/complete":
-            self.send_response(404)
-            self.end_headers()
+            self.respond(404, "application/json", b'{"error":true,"status":404,"message":"Not found."}')
+
             return
 
         try:
-            content_length = int(
-                self.headers.get("Content-Length", "0")
-            )
-
+            content_length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(content_length)
-
             data = json.loads(body.decode("utf-8"))
 
         except Exception as e:
-            print("[Twitch OAuth] Invalid POST:", e)
-
+            self._log("Invalid POST:", e)
             self.send_response(400)
             self.end_headers()
+
             return
 
-        handle_oauth_result(data)
+        # TODO: Refactor. Probably signal/message BRBScript instance to save oauth details to obs settings.
+        # handle_oauth_result(data)
+        if not self.callback(data):
+            self.respond(500, "application/json", b'{"error":true,"status":500,"message":"Server error."}')
 
-        response = b'{"ok":true}'
+        self.respond(200, "application/json", b'{"ok":true}')
 
-        self.send_response(200)
-        self.send_header(
-            "Content-Type",
-            "application/json"
-        )
-        self.send_header(
-            "Content-Length",
-            str(len(response))
-        )
-        self.send_header(
-            "Cache-Control",
-            "no-store"
-        )
-        self.end_headers()
-
-        self.wfile.write(response)
-
-        # We only need one OAuth callback.
-        #
-        # shutdown() is called from another thread so we don't deadlock
-        # the HTTP request thread.
-        server = _server
-
-        if server is not None:
+        # server.shutdown() is called from another thread so we don't
+        # deadlock the HTTP request thread processing this call to
+        # do_POST().
+        if self.server is not None:
             threading.Thread(
-                target=server.shutdown,
+                target=self.server.shutdown,
                 daemon=True
             ).start()
 
+    #######################################################################
+
+    def respond(self, code: int, content_type: str, body: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    #######################################################################
+
     def log_message(self, format, *args):
-        # Keep the OBS log clean.
-        pass
+        level = obs.DEBUG
+        message = format % args
+        obs.script_log(level, f"[{self.__class__.__name__}] {message}")
 
 
-
-###############################################################################
+###########################################################################
 # Twitch OAuth wrapper
-###############################################################################
+###########################################################################
 
-class TwitchOAuth
+class TwitchOAuth:
 
     def __init__(self):
-        # ============================================================================
+        # =================================================================
         # Runtime state
-        # ============================================================================
+        # =================================================================
 
         self.server = None
         self.server_thread = None
@@ -1421,9 +1390,9 @@ class TwitchOAuth
         self.state_lock = threading.Lock()
 
 
-    ###############################################################################
+    #######################################################################
     # OAuth flow
-    ###############################################################################
+    #######################################################################
 
     def starter(self, pressed):
         if not pressed:
@@ -1452,7 +1421,7 @@ class TwitchOAuth
         self.server_thread = threading.Thread(
             target=self.run_oauth_server,
             daemon=True,
-            name="Twitch OAuth Server"
+            name=f"{SCRIPT_NAME} Twitch OAuth Receiver"
         )
 
         self.server_thread.start()
@@ -1609,113 +1578,295 @@ class TwitchOAuth
             # Don't print the actual access token to the OBS log.
 
 
-# ============================================================================
+###########################################################################
 # OAuth processing
-# ============================================================================
+###########################################################################
 
 class TwitchOAuthServer(http.server.ThreadingHTTPServer):
 
     allow_reuse_address = True
 
     def __init__(self):
+        # TODO: Make the port dynamic based on availability
         super().__init__(
-            (REDIRECT_HOST, REDIRECT_PORT),
+            (TWITCH_REDIRECT_HOST, TWITCH_REDIRECT_PORT),
             TwitchOAuthHandler
         )
 
+    #######################################################################
+
+    @staticmethod
+    def _log(self, message, level = obs.LOG_ERROR):
+        obs.script_log(level, f"[{self.__class__.__name__}] {message}")
 
 
 
 
 
 
-###############################################################################
+###########################################################################
 # Main Controller
-###############################################################################
+###########################################################################
 
 class BRBScript:
+    """
+    This class serves as the scripts main controller.
+
+    It provides methods for the OBS hook functions to call, in order to keep all business logic consolidated here.
+
+    Classes used by BRBScript are expected not to use any method from the `obs` module unless that's their sole purview. This is mostly accomplished with dependency injection-- passing in handlers and callbacks to the classes.
+
+    Architecture:
+
+        BRBScript -----------------------------------------------|
+            |          v        |                |               |
+            |      TwitchApi    |                |               |
+            v                   v                v               v
+        TwitchOauth       TwitchIRCClient   GuessManager    TimerRenderer
+            |                   |                |               |
+            v                   v                v               v
+        TwitchOAuthServer  ChatMessage        BRBState       SourceGenerator
+            |
+            v
+        TwitchOAuthHandler
+
+    Example lifecycle:
+
+    * OBS Launches ->
+        * script_defaults() called
+            * provide default property values.
+        * script_description() called
+            * provide static string.
+        * script_load() called
+            * check for existing twitch oauth creds
+        * script_update() called once
+            * saves any new settings.
+
+    * User opens the script's Properties pane in the GUI ->
+        * script_properties() called
+            * construct script properties for display in GUI.
+        * whenever a property value is changed ->
+            * script_update() called.
+
+    * OBS_FRONTEND_EVENT_FINISHED_LOADING event fires ->
+        * handler:
+            * creates text source if it doesn't exist.
+            * registers event handlers to:
+                * respond to OBS_FRONTEND_EVENT_FINISHED_LOADING
+                * create IRC background thread when streamer goes live
+                * kill irc when streaming stops
+
+    * "Connect Twitch" button clicked ->
+        * BRBScript:
+            * launches a local webserver thread
+            * opens browser window.
+    * Web server thread handles POST successfully ->
+        * calls self.callback(data) -> writes oauth creds to script's OBS internal settings
+        * web server thread shuts down.
+
+    * Streamer starts broadcasting ->
+        * handler starts irc thread
+        * resets BRBState
+    * script_tick() called for every rendered frame ->
+        * (We do nothing.)
+    * Mod enters !brb in chat -> irc client notifies BRBScript -> BRBScript:
+        * updates GuessManager state
+        * tells IRC to print chat message.
+    * Chatters enter !at commands -> irc client notifies BRBScript -> BRBScript:
+        * updates GuessManager state
+        * prints chat message.
+    * Mod enters !back command -> irc client notifies BRBScript -> BRBScript:
+        * updates GuessManager state
+        * prints chat message.
+    * Streamer stops broadcasting ->
+        * handler stops irc thread
+        * resets BRBState
+
+    * OBS shuts down ->
+        * script_save() -> save any settings
+        * script_unload() -> clean up any remaining threads.
+
+    Ref: https://obsproject.com/kb/scripting-guide#script-lifecycle
+    """
 
     def __init__(self):
         self.state = BRBState()
         self.guesses = GuessManager(self.state)
         self.renderer = TimerRenderer()
         self.irc: Optional[TwitchIRCClient] = None
+        self.server: Optional[TwitchOAuthServer] = None
 
-    ###########################################################################
+    #######################################################################
     # Lifecycle
-    ###########################################################################
+    #######################################################################
 
     def start(self):
         config = obs.obs_frontend_get_profile_config()
         token = obs.config_get_string(config, "Twitch", "Token")
 
         if token is None:
-            log('OBS not logged into Twitch.')
+            self._log('OBS not logged into Twitch.', obs.INFO)
             return
 
-        api = TwitchApi(token)
+        api = TwitchApi(TWITCH_APP_CLIENT_ID, token)
         channel = api.channel()
         username = api.username()
-        callback = callable[ChatMessage] # TODO
+        callback = callable[ChatMessage] # TODO hook this up
 
+        # TODO: Don't do this till streaming starts.
         self.irc = TwitchIRCClient(channel, username, token, callback)
+
+    #######################################################################
 
     def shutdown(self):
         raise NotImplementedError
+        # TODO: Stop all threads.
+        # Save settings.
 
-    ###########################################################################
-    # Commands
-    ###########################################################################
+    #######################################################################
+    # Chat Command Callbacks
+    #######################################################################
 
     def command_brb(self, username: str):
+        """
+        Handler that's called when self.irc returns a ChatMessage with a !brb commands.
+        """
         raise NotImplementedError
+
+    #######################################################################
 
     def command_back(self, username: str):
+        """
+        Handler that's called when self.irc returns a ChatMessage with a !back commands.
+        """
         raise NotImplementedError
+
+    #######################################################################
 
     def command_at(self, username: str, guess: str):
+        """
+        Handler that's called when self.irc returns a ChatMessage with an !at commands.
+        """
         raise NotImplementedError
 
-    ###########################################################################
+    #######################################################################
     # OBS
-    ###########################################################################
+    #######################################################################
 
     def tick(self):
         raise NotImplementedError
 
+    #######################################################################
+
+    def twitch_channel(self):
+        raise NotImplementedError
+        # TODO: Call TwitchApi.channel() (when available), otherwise return empty string.
+
+    #######################################################################
+
+    def twitch_creds_present(self) -> bool:
+        raise NotImplementedError
+        # TODO: Return True when script has a non-expired access token in OBS local storage. False when no creds present in storage.
+
+    #######################################################################
+
+    def twitch_creds_expired(self) -> bool:
+        raise NotImplementedError
+        # TODO: Return True when script has an expired access token in OBS local storage.
+
+    #######################################################################
+
+    def twitch_creds_connect(self):
+        raise NotImplementedError
+        # TODO: Start local https server thread, open browser window.
+        # self.oauth_flow_start()
+
+    #######################################################################
+
+    def twitch_creds_disconnect(self):
+        raise NotImplementedError
+        # TODO: Remove script stored twitch settings from OBS.
+
+    #######################################################################
+
+    def twitch_creds_reconnect(self):
+        self.twitch_creds_disconnect()
+        self.twitch_creds_connect()
+
+    #######################################################################
+
+    def oauth_flow_start(self):
+        raise NotImplementedError
+        # TODO: start background http server thread, open browser URL.
+        # TODO: Implement opening an in-OBS browser with for Twitch OAuth flow with proper scopes and capturing the resulting token and refresh token in script's obs storage. How OBS does it in C++:
+        # Ref: https://github.com/obsproject/obs-studio/blob/14e3dae77f9893a15d69c8b7bae57ac8ab961f59/frontend/oauth/TwitchAuth.cpp#L210
+
+    #######################################################################
+
+    def oauth_flow_end(self):
+        raise NotImplementedError
+        # TODO: stop the background http server thread
+
+    #######################################################################
+    # Internal Helpers
+    #######################################################################
+
+    @staticmethod
+    def _log(self, message, level = obs.LOG_ERROR):
+        obs.script_log(level, f"[{self.__class__.__name__}] {message}")
 
 
 
-###############################################################################
+###########################################################################
 # Global Script Instance
-###############################################################################
+###########################################################################
 
 script = BRBScript()
 
 
-###############################################################################
+###########################################################################
 # OBS Script API
-###############################################################################
+###########################################################################
 
 def script_description():
     return (
         "BRB Timer\n\n"
-        "Let chatters guess when the streamer will return from being AFK.\n"
+        "<a href=\"https://github.com/beporter/brb-timer\">github.com/beporter/brb-timer</a>\n\n"
+        "Let chatters guess when the streamer will return from being AFK.\n\n"
         f"Mods can use {CMD_BRB} to start the on-screen timer and allow guessing.\n"
         f"Chatters can use <code>{CMD_AT} MM:SS</code> to enter a single gueess.\n"
         "Chatters can't guess multiple times because they could just keep updating their guess as the timer gets higher and higher.",
         f"Mods can end the guessing when the streamer returns with {CMD_BACK}.\n"
-        "The closest without going over will be displayed in the chat.\n"
+        "The closest without going over will be displayed as winner in the chat.\n"
     )
 
+###########################################################################
 
 def script_properties():
 
     props = obs.obs_properties_create()
 
-    # TODO: Implement opening an in-OBS browser with for Twitch OAuth flow with proper scopes and capturing the resulting token and refresh token in script's obs storage. How OBS does it in C++:
-    # Ref: https://github.com/obsproject/obs-studio/blob/14e3dae77f9893a15d69c8b7bae57ac8ab961f59/frontend/oauth/TwitchAuth.cpp#L210
-    #obs.obs_properties_add_button(props, TODO)
+    if script.twitch_creds_expired():
+        obs.obs_properties_add_button(
+            props,
+            "connect_twitch_button"
+            "Connect Twitch",
+            script.twitch_creds_reconnect()
+        )
+    elif script.twitch_creds_present():
+        obs.obs_properties_add_button(
+            props,
+            "disconnect_twitch_button"
+            "Disconnect Twitch",
+            script.twitch_creds_disconnect()
+        )
+    else:
+        obs.obs_properties_add_button(
+            props,
+            "connect_twitch_button"
+            "Connect Twitch",
+            script.twitch_creds_connect()
+        )
 
     obs.obs_properties_add_text(
         props,
@@ -1730,14 +1881,8 @@ def script_properties():
         "Bot Username",
         obs.OBS_TEXT_DEFAULT,
     )
-#
-#     obs.obs_properties_add_text(
-#         props,
-#         "oauth_token",
-#         "OAuth Token",
-#         obs.OBS_TEXT_PASSWORD,
-#     )
 
+    # TODO: If we're auto-creating, maybe this should either be a button, or a dropdown list?
     obs.obs_properties_add_text(
         props,
         "text_source",
@@ -1763,10 +1908,7 @@ def script_properties():
 
     return props
 
-
-def get_twitch_channel_name():
-    return 'TODO: Implement after getting Twitch OAuth flow working.'
-
+###########################################################################
 
 def script_defaults(settings):
     obs.obs_properties_add_button(
@@ -1776,10 +1918,11 @@ def script_defaults(settings):
         oauth_starter
     )
 
+    # TODO: Default to TwitchApi.channel() value, when available.
     obs.obs_data_set_default_string(
         settings,
         "channel_name",
-        get_twitch_channel_name(),
+        script.twitch_channel(),
     )
 
     obs.obs_data_set_default_string(
@@ -1803,6 +1946,7 @@ def script_defaults(settings):
         DEFAULT_CLIENT_ID,
     )
 
+###########################################################################
 
 def script_update(settings):
 
@@ -1815,6 +1959,7 @@ def script_update(settings):
 
     )
 
+###########################################################################
 
 def script_load(settings):
     """
@@ -1865,6 +2010,7 @@ def script_load(settings):
 
     obs.script_log(obs.LOG_INFO, f"{SCRIPT_NAME} loaded.")
 
+###########################################################################
 
 def script_save(settings):
     """
@@ -1906,6 +2052,7 @@ def script_save(settings):
         scopes
     )
 
+###########################################################################
 
 def script_unload():
     """
@@ -1940,63 +2087,57 @@ def script_unload():
 
 
 
-
-
-
-
-
-
 ############################################################
 ### skeleton obs script with http server
 
 ## Unused?
 
-class TwitchOauth:
+# class TwitchOauth:
 
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
-import threading
-
-
-class CallbackHandler(BaseHTTPRequestHandler):
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-
-        print("REDIRECT URL:", self.path)
-
-        if parsed.path == "/callback":
-            params = parse_qs(parsed.query)
-
-            code = params.get("code", [None])[0]
-
-            print("CODE:", code)
-
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-
-            self.wfile.write(
-                b"<h1>Login complete. You can close this window.</h1>"
-            )
-
-    def log_message(self, format, *args):
-        pass
+# from http.server import BaseHTTPRequestHandler, HTTPServer
+# from urllib.parse import urlparse, parse_qs
+# import threading
 
 
-def start_server():
-    server = HTTPServer(
-        ("127.0.0.1", 8765),
-        CallbackHandler
-    )
+# class CallbackHandler(BaseHTTPRequestHandler):
 
-    server.serve_forever()
+#     def do_GET(self):
+#         parsed = urlparse(self.path)
+
+#         print("REDIRECT URL:", self.path)
+
+#         if parsed.path == "/callback":
+#             params = parse_qs(parsed.query)
+
+#             code = params.get("code", [None])[0]
+
+#             print("CODE:", code)
+
+#             self.send_response(200)
+#             self.send_header("Content-Type", "text/html")
+#             self.end_headers()
+
+#             self.wfile.write(
+#                 b"<h1>Login complete. You can close this window.</h1>"
+#             )
+
+#     def log_message(self, format, *args):
+#         pass
 
 
-threading.Thread(
-    target=start_server,
-    daemon=True
-).start()
+# def start_server():
+#     server = HTTPServer(
+#         ("127.0.0.1", 8765),
+#         CallbackHandler
+#     )
+
+#     server.serve_forever()
+
+
+# threading.Thread(
+#     target=start_server,
+#     daemon=True
+# ).start()
 
 
 """
