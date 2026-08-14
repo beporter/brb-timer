@@ -119,6 +119,32 @@ https://github.com/dmadison/OBS-ChatSpam/blob/master/OBS_ChatSpam.py
 https://github.com/upgradeQ/Streaming-Software-Scripting-Reference#set-current-stream-key
 
 
+## TODO
+
+- Standardize class and methods separators/spacing.
+
+```md
+# =========================================================================
+# Global Section
+
+###########################################################################
+# Class
+###########################################################################
+
+    # ---------------------------------------------------------------------
+    # Section
+    # ---------------------------------------------------------------------
+
+    #######################################################################
+    def method():
+        """
+        Method description/purpose.
+        """
+```
+
+- Convert all uses of _log.
+
+
 ## License
 
 [MIT](/LICENSE.md)
