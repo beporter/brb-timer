@@ -8,25 +8,23 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from textwrap import dedent
+import errno
 import http.client as http_client
 import http.server
 import inspect
 import json
 import logging
-import os.path
-import queue
 import secrets
 import socket
 import ssl
 import sys
+from textwrap import dedent
 import threading
 import time
 from typing import Callable, Dict, Optional
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 import webbrowser
 
 logging.basicConfig(level=logging.DEBUG)
@@ -45,8 +43,9 @@ except ImportError:
     # `NameError: name 'obs' is not defined.`
     from unittest.mock import Mock
     obs = Mock()
+    obs.script_log = lambda _lvl, msg: print(msg)
 
-    logging.debug('obs module unavailble. Replaced with a mock.')
+    logging.debug('obs module unavailable. Replaced with a mock.')
 
 
 ###########################################################################
@@ -261,7 +260,7 @@ class OBS:
 
     #######################################################################
     @contextmanager
-    @staticmethod
+    @classmethod
     def source_by_name(self, name: str):
         """
         Yield the source identified by the provided name, if possible.
@@ -278,7 +277,7 @@ class OBS:
 
     #######################################################################
     @contextmanager
-    @staticmethod
+    @classmethod
     def source_by_uuid(self, uuid: str):
         """
         Yield the source identified by the provided uuid, if possible.
@@ -295,7 +294,7 @@ class OBS:
 
     #######################################################################
     @contextmanager
-    @staticmethod
+    @classmethod
     def source_name_in_scene(self, source_name: str, scene = None):
         """
         Yield the source from the provided scene, if present.
@@ -314,7 +313,7 @@ class OBS:
 
     #######################################################################
     @contextmanager
-    @staticmethod
+    @classmethod
     def source_create(self):
         """
         Yield a brand new source.
@@ -328,6 +327,7 @@ class OBS:
             obs.obs_source_release(source)
 
     #######################################################################
+    @classmethod
     def source_create_text(
         self,
         text: str = "",
@@ -377,7 +377,7 @@ class OBS:
 
     #######################################################################
     @contextmanager
-    @staticmethod
+    @classmethod
     def source_update(self, source, changes: Dict[str, any]):
         """
         Apply settings changes to the provided source.
@@ -386,7 +386,7 @@ class OBS:
             obs.obs_source_update(source, new_settings)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def source_save(self, source):
         """
         Save the provided source to OBS's persistent storage.
@@ -394,7 +394,7 @@ class OBS:
         return obs.obs_save_source(source)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def source_type(self, source) -> str:
         """
         Get the "ID" (which is really a 'source type id') for the
@@ -403,7 +403,7 @@ class OBS:
         return obs.obs_source_get_id(source)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def source_name(self, source) -> str:
         """
         Get the display name of the provided source.
@@ -411,7 +411,7 @@ class OBS:
         return obs.obs_get_source_name(source)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def source_uuid(self, source) -> str:
         """
         Get the display name of the provided source.
@@ -419,7 +419,7 @@ class OBS:
         return obs.obs_get_source_uuid(source)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def source_text(self, source) -> str:
         """
         Get the on-screen text for the provided source.
@@ -439,7 +439,7 @@ class OBS:
 
     #######################################################################
     @contextmanager
-    @staticmethod
+    @classmethod
     def scene_current(self):
         """
         Yields an obs_scene object and auto-releases afterward.
@@ -467,7 +467,7 @@ class OBS:
             obs.obs_scene_release(scene)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def scene_name(self, scene = None) -> str:
         """
         Get the display name of the provided scene.
@@ -478,7 +478,7 @@ class OBS:
             return obs.obs_get_scene_name(scene)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def scene_active(self, scene) -> bool:
         """
         Returns true when the provided scene is the currently active scene.
@@ -494,7 +494,7 @@ class OBS:
 
     #######################################################################
     @contextmanager
-    @staticmethod
+    @classmethod
     def scene_add(self, source, scene = None):
         """
         Yields a sceneitem object resulting from adding the provided
@@ -511,7 +511,7 @@ class OBS:
 
     #######################################################################
     @contextmanager
-    @staticmethod
+    @classmethod
     def sceneitem_by_name(self, name: str, scene = None):
         """
         Yields a sceneitem object matching the provided name. If no scene
@@ -527,7 +527,7 @@ class OBS:
             return sceneitem
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def sceneitem_set_visible(self, sceneitem, show: bool):
         """
         Tells OBS to show or hide the provided sceneitem on-screen.
@@ -537,7 +537,7 @@ class OBS:
         return obs.obs_sceneitem_set_visible(sceneitem, show)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def sceneitem_visible(self, sceneitem) -> bool:
         """
         Returnes true if the provided sceneitem is currently visible
@@ -546,7 +546,7 @@ class OBS:
         return obs.obs_sceneitem_visible(sceneitem)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def sceneitem_id(self, sceneitem) -> str:
         """
         Returns the OBS ID of the provided sceneitem.
@@ -558,6 +558,7 @@ class OBS:
     # ---------------------------------------------------------------------
 
     #######################################################################
+    @classmethod
     def transition_source_create(
         self,
         sceneitem,
@@ -613,7 +614,10 @@ class OBS:
 
         try:
             # Attach the transition to the scene item and set duration.
-            obs.obs_sceneitem_set_transition(target_item, visibility == "show", transition)
+            obs.obs_sceneitem_set_transition(
+                target_item, visibility == "show",
+                transition,
+            )
             obs.obs_sceneitem_set_transition_duration(
                 target_item,
                 visibility == "show",
@@ -623,11 +627,20 @@ class OBS:
             # Set on-screen position to top-right.
             vi = obs.obs_video_info()
             obs.obs_get_video_info(vi)
-            obs.obs_sceneitem_set_alignment(sceneitem, obs.OBS_ALIGN_RIGHT | obs.OBS_ALIGN_TOP)
-            obs.obs_sceneitem_set_pos(sceneitem, obs.vec2(vi.base_width, 0))
+            obs.obs_sceneitem_set_alignment(
+                sceneitem,
+                obs.OBS_ALIGN_RIGHT | obs.OBS_ALIGN_TOP,
+            )
+            obs.obs_sceneitem_set_pos(
+                sceneitem,
+                obs.vec2(vi.base_width, 0),
+            )
 
             # Set z-index to top.
-            obs.obs_sceneitem_set_order(sceneitem, obs.OBS_ORDER_MOVE_TOP) # layer on top
+            obs.obs_sceneitem_set_order(
+                sceneitem,
+                obs.OBS_ORDER_MOVE_TOP,
+            ) # layer on top
 
             # Set item bounds.
             # obs.obs_sceneitem_set_bounds_type(sceneitem, obs.OBS_BOUNDS_SCALE_TO_WIDTH)
@@ -642,19 +655,25 @@ class OBS:
         return uuid
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def transition_duration(self, transition_sceneitem, visibility: str):
         try:
-            duration = obs.obs_sceneitem_get_transition_duration(transition_sceneitem, visibility == "show")
+            duration = obs.obs_sceneitem_get_transition_duration(
+                transition_sceneitem,
+                visibility == "show",
+            )
         finally:
             obs.obs_sceneitem_release(transition_sceneitem)
 
         return duration
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def transition_target(self, transition_sceneitem, visibility: str):
-        target = obs.obs_sceneitem_get_transition(transition_sceneitem, visibility == "show")
+        target = obs.obs_sceneitem_get_transition(
+            transition_sceneitem,
+            visibility == "show",
+        )
 
         return self.source_uuid(target)
 
@@ -664,7 +683,7 @@ class OBS:
 
     #######################################################################
     @contextmanager
-    @staticmethod
+    @classmethod
     def text_settings(
         self,
         text: str,
@@ -716,7 +735,7 @@ class OBS:
 
     #######################################################################
     @contextmanager
-    @staticmethod
+    @classmethod
     def data(self, source_settings = None):
         """
         Helper that yields an obs_data object either from the
@@ -742,13 +761,13 @@ class OBS:
             obs.obs_data_release(data)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def data_get_json(self, data):
         return json.load(obs.obs_data_get_json(data))
 
     #######################################################################
     @contextmanager
-    @staticmethod
+    @classmethod
     def data_set_all(self, changes):
         """
         Currently only handles scalar values.
@@ -760,10 +779,11 @@ class OBS:
             yield new_settings
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def data_set(data, key: str, val: any, **args):
         """
-        Attempts to call the appropriate obs_data_set_*()` method by examining the python type of the supplied value.
+        Attempts to call the appropriate obs_data_set_*()` method by
+        examining the python type of the supplied value.
         """
         match type(val).__name__:
             case 'int':
@@ -774,12 +794,12 @@ class OBS:
                 OBS.data_set_string(data, key, val)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def data_set_string(self, data, key: str, val: str):
         obs.obs_data_set_string(data, key, val)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def data_set_int(
         self,
         data,
@@ -797,7 +817,7 @@ class OBS:
     # ---------------------------------------------------------------------
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def event_register_router(self):
         """
         This method is the public interface for registering our wrapper's
@@ -815,6 +835,7 @@ class OBS:
         # obs.obs_source_release(source)
 
     #######################################################################
+    @classmethod
     def event_router(self, event: int):
         """
         After OBS.event_register_router() has been called, this method
@@ -828,11 +849,13 @@ class OBS:
             return self._event[event]()
 
     #######################################################################
+    @classmethod
     def event_add(self, event: int, callback: Callable):
         """
         Register a callback for a specific OBS event.
 
-        The calling context MUST have already called OBS.event_register_router()
+        The calling context MUST have already called
+        OBS.event_register_router()
         """
         self._events[event] += callback
         self.debug(f"Event listener registered: {callback.__name__}")
@@ -843,27 +866,27 @@ class OBS:
     # ---------------------------------------------------------------------
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def error(self, msg: str):
         self._log(msg, obs.LOG_ERROR)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def warn(self, msg: str):
         self._log(msg, obs.LOG_WARNING)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def info(self, msg: str):
         self._log(msg, obs.LOG_INFO)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def debug(self, msg: str):
         self._log(msg, obs.LOG_DEBUG)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def log_source(self, source):
         msg = "<Source name='%s', uuid='%s', type='%s' contents='%s'>\n" % (
             self.source_name(source),
@@ -874,7 +897,7 @@ class OBS:
         self._log(msg, obs.LOG_DEBUG)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def log_scene(self, scene, sceneitem):
         msg = "<%sScene name='%s', sceneitem_id='%s'>\n" % (
             "Active " if self.scene_active(scene) else "",
@@ -884,7 +907,7 @@ class OBS:
         self._log(msg, obs.LOG_DEBUG)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def log_transition(self, transition_source, transition_sceneitem):
         with self.transition_source(transition_sceneitem, True) as show_source:
             if transition_source == show_source:
@@ -904,14 +927,30 @@ class OBS:
         self._log(msg, obs.LOG_DEBUG)
 
     #######################################################################
-    @staticmethod
+    @classmethod
     def _log(self, msg: str, level: int):
-        curframe = inspect.currentframe()
-        calframe = inspect.getouterframes(curframe, 2) # __qualname__
-        calling_method = calframe[1][3]
+        # Grab our frame and at most three parent frames.
+        stack = inspect.stack(0)[0:3]
+
+        # The last element in the slice of 3 is the farthest-most caller.
+        # Handles the case where there's less than 2 stacks above us.
+        callers_caller_frameinfo = stack[-1]
+
+        # Dig into the frame details to get the fully qualified method name.
+        calling_method = callers_caller_frameinfo.frame.f_code.co_qualname
 
         obs.script_log(level, f"[{calling_method}] {msg}")
 
+# TODO: Remove
+# Wrapper.called_method() -> Wrapper._log() -> OBS.debug() -> OBS._log()
+# class Wrapper:
+#     @classmethod
+#     def called_method(self):
+#         self._log('important message')
+#     @classmethod
+#     def _log(self, msg):
+#         print("sending: " + msg)
+#         OBS.debug(msg)
 
 ###########################################################################
 # Twitch IRC Client
@@ -919,7 +958,8 @@ class OBS:
 
 class TwitchIRCClient:
     """
-    Although Twitch now recommends EventSub for many integrations, chat over IRC is still supported and is perfectly adequate for this project.
+    Although Twitch now recommends EventSub for many integrations, chat
+    over IRC is still supported and is perfectly adequate for this project.
 
     The IRC client should have one responsibility:
 
@@ -931,7 +971,9 @@ class TwitchIRCClient:
         ↓
     CommandParser
 
-    It knows nothing about `!brb`, `!at`, timers, guesses, etc. and encodes its message parsing into ChatMessage payloads to keep raw IRC lines out of the rest of the app.
+    It knows nothing about `!brb`, `!at`, timers, guesses, etc. and
+    encodes its message parsing into ChatMessage payloads to keep raw
+    IRC lines out of the rest of the app.
     """
 
     HOST = "irc.chat.twitch.tv"
@@ -1328,7 +1370,7 @@ class GuessManager:
     manager->add_guess(username, secs)
     manager->add_guess(diff_user, diff_secs)
     manager->end()                        # Block guesses.
-    manager->winner()                     # Return winner for the last set of guesses, till reset.
+    manager->winner()                     # Return last winner, till reset.
     manager->clear()                      # Reset back to defaults.
     """
 
@@ -1439,9 +1481,9 @@ class TwitchApi:
             return False
 
         if TwitchOAuth.OAUTH_SCOPES not in resp['scopes']:
+            missing_scopes = ", ".join(set(TwitchOAuth.OAUTH_SCOPES) - set(resp['scopes']))
             OBS.debug(
-                "OAuth token is lacking necessary scopes: (%s)" %
-                (set(TwitchOAuth.OAUTH_SCOPES) - set(resp['scopes'])).join(", ")
+                "OAuth token is lacking necessary scopes: (%s)" % (missing_scopes),
             )
             return False
 
@@ -1758,7 +1800,6 @@ class TwitchOAuthServer(http.server.ThreadingHTTPServer):
 
     allow_reuse_address = True
 
-
     # This host and these ports MUST be defined in the Twitch Developer
     # Console. If none of these are available on the machine running
     # OBS, the whole OAuth flow will fail.
@@ -1774,8 +1815,20 @@ class TwitchOAuthServer(http.server.ThreadingHTTPServer):
 
     #######################################################################
     def _find_port(self) -> int:
-        # TODO: Make the port dynamic based on availability
-        return self.PORT_OPTIONS[0]
+        for port in self.PORT_OPTIONS:
+            try:
+                sock = socket.create_server(('', port), reuse_port = True)
+                sock.close()
+                return port
+
+            except OSError as e:
+                if e.errno == errno.EADDRINUSE:
+                    continue
+
+        raise RuntimeError(
+            'No port available for local HTTP server from configured choices: %s'
+            % " ".join(self.PORT_OPTIONS)
+        ) # or ValueError?
 
 
 ###########################################################################
@@ -1818,7 +1871,8 @@ class TwitchOAuthHandler(http.server.BaseHTTPRequestHandler):
                 const status = document.getElementById("status");
 
                 try {
-                    // Twitch implicit grant puts the OAuth response in the URL fragment, not the query string.
+                    // Twitch implicit grant puts the OAuth response
+                    // in the URL fragment, not the query string.
                     const fragment = window.location.hash.substring(1);
 
                     if (!fragment) {
@@ -2123,20 +2177,24 @@ class BRBScript:
     """
     This class serves as the scripts main controller.
 
-    It provides methods for the OBS hook functions to call, in order to keep all business logic consolidated here.
+    It provides methods for the OBS hook functions to call, in order to
+    keep all business logic consolidated here.
 
-    Classes used by BRBScript are expected not to use any method from the `obs` module unless that's their sole purview. This is mostly accomplished with dependency injection-- passing in handlers and callbacks to the classes.
+    Classes used by BRBScript are expected not to use any method from
+    the `obs` module unless that's their sole purview. This is mostly
+    accomplished with dependency injection-- passing in handlers and
+    callbacks to the classes.
 
     Architecture:
 
-        BRBScript -----------------------------------------------|
-            |          v        |        v       |               |
-            |      TwitchApi    |   BRBSettings  |               |
-            v                   v                v               v
-        TwitchOauth       TwitchIRCClient   GuessManager    TimerRenderer
-            |                   |                |               |
-            v                   v                v               v
-        TwitchOAuthServer  ChatMessage        BRBState       SourceGenerator
+        BRBScript ---------------------------------------------|
+            |          v        |        v       |             |
+            |      TwitchApi    |   BRBSettings  |             |
+            v                   v                v             v
+        TwitchOauth       TwitchIRCClient   GuessManager  TimerRenderer
+            |                   |                |             |
+            v                   v                v             v
+        TwitchOAuthServer  ChatMessage        BRBState   SourceGenerator
             |
             v
         TwitchOAuthHandler
@@ -2292,7 +2350,8 @@ class BRBScript:
     #######################################################################
     def on_streaming_starting(self):
         """
-        Script "main loop". Start up the IRC client to listen for chat commands.
+        Script "main loop". Start up the IRC client to listen for chat
+        commands.
         """
         # TODO: Rewrite this to use our own twitch oauth token instead of OBS's
 
@@ -2371,7 +2430,8 @@ class BRBScript:
     #######################################################################
     def command_brb(self, msg: ChatMessage):
         """
-        Handler that's called when self.irc returns a ChatMessage with a !brb commands.
+        Handler that's called when self.irc returns a ChatMessage with
+        a !brb command.
         """
         raise NotImplementedError
         # TODO: Move this where it needs to go.
@@ -2395,14 +2455,16 @@ class BRBScript:
     #######################################################################
     def command_back(self, msg: ChatMessage):
         """
-        Handler that's called when self.irc returns a ChatMessage with a !back commands.
+        Handler that's called when self.irc returns a ChatMessage with
+        a !back command.
         """
         raise NotImplementedError
 
     #######################################################################
     def command_at(self, msg: ChatMessage):
         """
-        Handler that's called when self.irc returns a ChatMessage with an !at commands.
+        Handler that's called when self.irc returns a ChatMessage with
+        an !at command.
         """
         raise NotImplementedError
 
@@ -2484,7 +2546,7 @@ def script_description():
     """
     Uses some kind of Qt formatting.
 
-    Ref: TODO: Find the ref.
+    Ref: TODO: Find the ref and clean this up.
     """
     return dedent(f"""
         BRB Timer (<a href=\"https://github.com/beporter/brb-timer\">github.com/beporter/brb-timer</a>_
@@ -2541,11 +2603,17 @@ def script_properties():
 ###########################################################################
 def script_defaults(settings):
     """
-    This lifecycle methods is called EARLY in the script's startup process. Before `script_properties()` is even called for the first time.
+    This lifecycle methods is called EARLY in the script's startup
+    process. Before `script_properties()` is even called for the first
+    time.
 
-    The defaults defined here must track with the properties defined above in script_properties().
+    The defaults defined here must track with the properties defined
+    above in script_properties().
 
-    If a given property is conditional or doesn't have a default, it still gets a comment here in the proper order to keep the two functions in lock step and so project-wide search turns up both places consistently.
+    If a given property is conditional or doesn't have a default, it
+    still gets a comment here in the proper order to keep the two
+    functions in lock step and so project-wide search turns up both
+    places consistently.
     """
 
     # "connect_twitch_button": no default
@@ -2653,207 +2721,9 @@ def script_unload():
 
 
 
-###########################################################################
+############################################################
 # TODO: Remove the below once it has been integrated.
 ############################################################
-### skeleton obs script with http server
-
-## Unused?
-
-# class TwitchOauth:
-
-# from http.server import BaseHTTPRequestHandler, HTTPServer
-# from urllib.parse import urlparse, parse_qs
-# import threading
-
-
-# class CallbackHandler(BaseHTTPRequestHandler):
-
-#     def do_GET(self):
-#         parsed = urlparse(self.path)
-
-#         print("REDIRECT URL:", self.path)
-
-#         if parsed.path == "/callback":
-#             params = parse_qs(parsed.query)
-
-#             code = params.get("code", [None])[0]
-
-#             print("CODE:", code)
-
-#             self.send_response(200)
-#             self.send_header("Content-Type", "text/html")
-#             self.end_headers()
-
-#             self.wfile.write(
-#                 b"<h1>Login complete. You can close this window.</h1>"
-#             )
-
-#     def log_message(self, format, *args):
-#         pass
-
-
-# def start_server():
-#     server = HTTPServer(
-#         ("127.0.0.1", 8765),
-#         CallbackHandler
-#     )
-
-#     server.serve_forever()
-
-
-# threading.Thread(
-#     target=start_server,
-#     daemon=True
-# ).start()
-
-
-# TODO: Remove the below once it has been integrated.
-"""
-From `/Users/beporter/Library/Application Support/obs-studio/basic/scenes/Untitled.json`
-In OBS Menus: File > Show Settings Folder
-Navigate through: basic > scenes
-
-    "sources": [
-        {
-            "prev_ver": 536870916,
-            "name": "Scene",
-            "uuid": "db8355a7-f1c1-44ef-8149-ffc9f6a3bec5",
-            "id": "scene",
-            "versioned_id": "scene",
-            "settings": {
-                "id_counter": 1,
-                "custom_size": false,
-                "items": [
-                    {
-                        "name": "example_text_source",
-                        "source_uuid": "91595f92-fffe-4d92-8f31-ccf64f503526",
-                        "visible": false,
-                        "locked": false,
-                        "rot": 0.0,
-                        "scale_ref": {
-                            "x": 1920.0,
-                            "y": 1080.0
-                        },
-                        "align": 5,
-                        "bounds_type": 0,
-                        "bounds_align": 0,
-                        "bounds_crop": false,
-                        "crop_left": 0,
-                        "crop_top": 0,
-                        "crop_right": 0,
-                        "crop_bottom": 0,
-                        "id": 1,
-                        "group_item_backup": false,
-                        "pos": {
-                            "x": 0.0,
-                            "y": 0.0
-                        },
-                        "pos_rel": {
-                            "x": -1.7777777910232544,
-                            "y": -1.0
-                        },
-                        "scale": {
-                            "x": 1.0,
-                            "y": 1.0
-                        },
-                        "scale_rel": {
-                            "x": 1.0,
-                            "y": 1.0
-                        },
-                        "bounds": {
-                            "x": 0.0,
-                            "y": 0.0
-                        },
-                        "bounds_rel": {
-                            "x": 0.0,
-                            "y": 0.0
-                        },
-                        "scale_filter": "disable",
-                        "blend_method": "default",
-                        "blend_type": "normal",
-                        "show_transition": {
-                            "id": "slide_transition",
-                            "versioned_id": "slide_transition",
-                            "name": "example_text_source Show Transition",
-                            "transition": {
-                                "direction": "left"
-                            },
-                            "duration": 300
-                        },
-                        "hide_transition": {
-                            "id": "slide_transition",
-                            "versioned_id": "slide_transition",
-                            "name": "example_text_source Hide Transition",
-                            "transition": {
-                                "direction": "right"
-                            },
-                            "duration": 300
-                        },
-                        "private_settings": {}
-                    }
-                ]
-            },
-            "mixers": 0,
-            "sync": 0,
-            "flags": 0,
-            "volume": 1.0,
-            "balance": 0.5,
-            "enabled": true,
-            "muted": false,
-            "push-to-mute": false,
-            "push-to-mute-delay": 0,
-            "push-to-talk": false,
-            "push-to-talk-delay": 0,
-            "hotkeys": {
-                "OBSBasic.SelectScene": [],
-                "libobs.show_scene_item.1": [],
-                "libobs.hide_scene_item.1": []
-            },
-            "deinterlace_mode": 0,
-            "deinterlace_field_order": 0,
-            "monitoring_type": 0,
-            "canvas_uuid": "6c69626f-6273-4c00-9d88-c5136d61696e",
-            "private_settings": {}
-        },
-        {
-            "prev_ver": 536870916,
-            "name": "example_text_source",
-            "uuid": "91595f92-fffe-4d92-8f31-ccf64f503526",
-            "id": "text_ft2_source",
-            "versioned_id": "text_ft2_source_v2",
-            "settings": {
-                "text": "hello world",
-                "font": {
-                    "face": "Monaco",
-                    "style": "Regular",
-                    "size": 256,
-                    "flags": 0
-                },
-                "outline": true,
-                "color2": 4294967295,
-                "drop_shadow": false
-            },
-            "mixers": 0,
-            "sync": 0,
-            "flags": 0,
-            "volume": 1.0,
-            "balance": 0.5,
-            "enabled": true,
-            "muted": false,
-            "push-to-mute": false,
-            "push-to-mute-delay": 0,
-            "push-to-talk": false,
-            "push-to-talk-delay": 0,
-            "hotkeys": {},
-            "deinterlace_mode": 0,
-            "deinterlace_field_order": 0,
-            "monitoring_type": 0,
-            "private_settings": {}
-        }
-    ],
-"""
-
 
 # Twitch API Notes
 
