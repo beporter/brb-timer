@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import datetime
 import errno
 import http.client as http_client
 import http.server
@@ -77,18 +78,24 @@ class COMMANDS:
     AT = "!at"
 
 class MESSAGES:
+    # Access control.
     ONLY_MOD_START = f"Only mods can start a {COMMANDS.BRB}."
     ONLY_MOD_END = f"Only mods can end a {COMMANDS.BRB} with {COMMANDS.BACK}."
+
+    # Reporting script state.
+    ALREADY_RUNNING = f"{COMMANDS.BRB} is already running! Must use {COMMANDS.BACK} first."
+    NO_BRB = (f"There's no {COMMANDS.BRB} running. A mod must use {COMMANDS.BRB} first.")
     BRB_STARTED = (
         "{streamer} is taking a break! "
         "Guess how long till they're back (without going over!) "
         "Type `{COMMANDS.AT} MM:SS` in chat!"
     )
-    ALREADY_RUNNING = f"{COMMANDS.BRB} is already running! Must use {COMMANDS.BACK} first."
-    GUESS_ACCEPTED = "{user} guesses {guess}."
-    ALREADY_GUESSED = "{user} already guessed {guess}. You can't change your guess!"
-    NO_BRB = (f"There's no {COMMANDS.BRB} running. A mod must use {COMMANDS.BRB} first.")
     BRB_FINISHED = ("{streamer} is back! Winner is: {winner}")
+
+    # Guessing.
+    BAD_GUESS = "Couldn't understand {user}'s guess. Format is MINS:SECS. For example:  '35:42' means you think the stream will return in 35 mins and 42 seconds."
+    ALREADY_GUESSED = "{user} already guessed {guess}. You can't change your guess!"
+    GUESS_ACCEPTED = "{user} guesses {guess}."
 
 
 ###########################################################################
@@ -370,9 +377,10 @@ class OBS:
 
                 # Return the first successfully created text source.
                 if source is not None:
+                    OBS.info(f"Using text source type '%s'.")
                     return source
 
-            # TODO: Add logging
+            OBS.error(f"Couldn't find an available text source type.")
             return None
 
     #######################################################################
@@ -860,6 +868,32 @@ class OBS:
         self._events[event] += callback
         self.debug(f"Event listener registered: {callback.__name__}")
 
+
+    #######################################################################
+    @classmethod
+    def start_ticking(self):
+        """
+        Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5/README.md?plain=1#L472
+        """
+        global script
+        self.timer = lambda: script.on_timer()
+        obs.timer_add(self.timer, 1000) # ms
+
+    #######################################################################
+    @classmethod
+    def stop_ticking(self):
+        obs.timer_remove(self.timer)
+        self.timer = None
+
+    #######################################################################
+    @classmethod
+    def auto_hide(self, callback: Callable, delay_secs: int):
+        obs.timer_add(callback, delay_secs * 1000) # ms
+
+    #######################################################################
+    @classmethod
+    def timer_remove_self(self):
+        obs.remove_current_callback()
 
     # ---------------------------------------------------------------------
     # Logging
@@ -1385,6 +1419,10 @@ class GuessManager:
         self.state.reset()
 
     #######################################################################
+    def running(self) -> bool:
+        return self.state.active
+
+    #######################################################################
     def start(self) -> None:
         self.state.last_result = self.winner()
 
@@ -1460,45 +1498,254 @@ class TwitchApi:
 
     #######################################################################
     def user(self, username):
+        """
+        Sample responses:
+
+        {'data': [ {
+            'id': '29519624',
+            'login': 'beporter',
+            'display_name': 'beporter',
+            'type': '',
+            'broadcaster_type': '',
+            'description': 'Just this guy, you know?',
+            'profile_image_url': 'https://static-cdn.jtvnw.net/jtv_user_pictures/20dc4771-48f3-4ad5-b894-91d067a577cb-profile_image-300x300.png',
+            'offline_image_url': '',
+            'view_count': 0,
+            'created_at': '2012-04-05T00:36:19Z'
+        } ] }
+
+        {'data': [ {
+            'broadcaster_id': '',
+            'login': 'enns',
+            'display_name': 'Enns',
+            'description': 'A regular fella.',
+            'profile_image_url': 'https://static-cdn.jtvnw.net/jtv_user_pictures/eb89494b-b2ca-4ace-886c-628ffbdbbdcc-profile_image-300x300.png',
+            'created_at': '2010-06-08T10:31:45Z'
+        } ] }
+        """
         resp = self._get('helix/users', {'login': username})
 
         if not resp:
-            OBS.debug("helix/users failed.")
+            OBS.error(f"helix/users failed for login: {username}")
             return False
 
-        return resp # TODO: Refine this.
+        if not resp.get('data') and resp.get('data', []).get(0):
+            OBS.error(f"No user data returned for login: {username}")
+            return False
+
+        user = resp.get('data')[0]
+
+        return {
+            'broadcaster_id': int(user.get('broadcaster_id', -1)),
+            'login': user.get('login', ''),
+            'display_name': user.get('display_name', ''),
+            'description': user.get('description', ''),
+            'profile_image_url': user.get('profile_image_url', ''),
+            'created_at': self._dt_iso_to_struct(user.get('created_at', None)),
+        }
 
     #######################################################################
     def validate(self) -> Dict[str, any] | False:
+        """
+        Sample response:
+
+        {
+            'client_id': 'ja5swzyzsr1euwm0e53h1sxqhk553l',
+            'login': 'beporter',
+            'scopes': [
+                'chat:edit',
+                'moderator:read:followers',
+                'moderator:read:moderators',
+                'user:bot'
+            ],
+            'user_id': '29519624',
+            'expires_in': 4765582
+        }
+
+        """
         resp = self._get('oauth2/validate')
 
         if not resp:
-            OBS.debug("oauth2/validate failed.")
+            OBS.error("oauth2/validate failed.")
             return False
 
         if not resp['login']:
-            OBS.debug("OAuth token is not attached to a user.")
+            OBS.error("OAuth token is not attached to a user.")
             return False
 
-        if TwitchOAuth.OAUTH_SCOPES not in resp['scopes']:
+        if not set(TwitchOAuth.OAUTH_SCOPES).issubset(resp['scopes']):
             missing_scopes = ", ".join(set(TwitchOAuth.OAUTH_SCOPES) - set(resp['scopes']))
-            OBS.debug(
+            OBS.error(
                 "OAuth token is lacking necessary scopes: (%s)" % (missing_scopes),
             )
             return False
 
-        return resp # TODO: Refine this.
-
-        # username = response['login']  # (username)
-        # user_id = response['user_id']  # (user_id)
+        return {
+            'client_id': resp.get('client_id', ''),
+            'login': resp.get('login', ''),
+            'scopes': resp.get('scopes', []),
+            'broadcaster_id': int(resp.get('user_id', '')),
+            'expires_in': resp.get('expires_in', None), # int seconds
+            'expires_at': self._dt_duration_to_struct(resp.get('expires_in', None)), # datetime
+        }
 
     #######################################################################
-    def channel(self, broadcaster_id):
-        # Ref: https://api.twitch.tv/helix/streams?user_login=$user&type=live&first=1
+    def channel(self, broadcaster_id: int) -> Dict[str, any]:
+        """
+        Sample response:
 
+        {'data': [ {
+            'broadcaster_id': '29519624',
+            'broadcaster_login': 'beporter',
+            'broadcaster_name': 'beporter',
+            'broadcaster_language': 'en',
+            'game_id': '509670',
+            'game_name': 'Science & Technology',
+            'title': '',
+            'delay': 0,
+            'tags': [],
+            'content_classification_labels': [],
+            'is_branded_content': False
+        } ] }
+        """
         resp = self._get('helix/channels', {'broadcaster_id': broadcaster_id})
 
-        return resp # TODO: Refine this.
+        if not resp:
+            OBS.error(f"helix/channels failed for broadcaster_id: {broadcaster_id}")
+            return False
+
+        if not resp.get('data') and resp.get('data', []).get(0):
+            OBS.error(f"No channel data returned for broadcaster_id: {broadcaster_id}")
+            return False
+
+        channel = resp.get('data')[0]
+
+        return {
+            'broadcaster_id': int(channel.get('broadcaster_id', -1)),
+            'broadcaster_login': channel.get('broadcaster_login', ''),
+            'broadcaster_name': channel.get('broadcaster_name', ''),
+            'broadcaster_language': channel.get('broadcaster_language', 'en'),
+            'game_id': int(channel.get('game_id', -1)),
+            'game_name': channel.get('game_name', ''),
+            'title': channel.get('title', ''),
+            'tags': channel.get('tags', []),
+            'content_classification_labels': channel.get('content_classification_labels', []),
+            'is_branded_content': bool(channel.get('is_branded_content', False)),
+        }
+
+    #######################################################################
+    def stream(self, username: str):
+        """
+        Only returns results if the username is currently live.
+
+        Ref: https://dev.twitch.tv/docs/api/reference#get-streams
+
+        Example response:
+
+        {
+            'id': '317239079159',
+            'user_id': '12989801',
+            'user_login': 'enns',
+            'user_name': 'Enns',
+            'game_id': '27284',
+            'game_name': 'Retro',
+            'type': 'live',
+            'title': 'Albus Seeks Death :(',
+            'viewer_count': 53,
+            'started_at': '2026-08-15T16:16:48Z',
+            'language': 'en',
+            'thumbnail_url': 'https://static-cdn.jtvnw.net/previews-ttv/live_user_enns-{width}x{height}.jpg',
+            'tag_ids': [],
+            'tags': ['me', 'commentary', 'Retro', 'Variety', 'deranged', 'LocalMan', 'Gardening', 'English', 'CommonDrop'],
+            'is_mature': False
+        }
+        """
+        resp = self._get('helix/streams', {
+            'user_login': username,
+            'type': 'all',
+            'first': 1,
+        })
+
+        if not resp:
+            OBS.error(f"helix/streams failed for username: {username}")
+            return False
+
+        if not resp.get('data') or len(resp.get('data', [])) == 0:
+            OBS.error(f"No stream data returned for username: {username}")
+            return False
+
+        stream = resp.get('data')[0]
+
+        return {
+            'stream_id': int(stream.get('id', -1)),
+            'broadcaster_id': int(stream.get('user_id', -1)),
+            'user_login': stream.get('user_login', ''),
+            'user_name': stream.get('user_name', ''),
+            'game_id': int(stream.get('game_id', -1)),
+            'game_name': stream.get('game_name', ''),
+            'type': stream.get('type', ''),
+            'title': stream.get('title', ''),
+            'viewer_count': int(stream.get('viewer_count', -1)),
+            'started_at': self._dt_iso_to_struct(stream.get('started_at')),
+            'language': stream.get('language', 'en'),
+            'thumbnail_url': stream.get('thumbnail_url', ''),
+            'tag_ids': stream.get('tag_ids', []),
+            'tags': stream.get('tags', []),
+            'is_mature': bool(stream.get('is_mature', False)),
+        }
+
+    #######################################################################
+    def search(self, username: str):
+        """
+        Ref: https://dev.twitch.tv/docs/api/reference#search-channels
+
+        Sample response:
+
+        {"data": [ {
+            "broadcaster_language": "en",
+            "broadcaster_login": "a_seagull",
+            "display_name": "A_Seagull",
+            "game_id": "506442",
+            "game_name": "DOOM Eternal",
+            "id": "19070311",           // TODO: This is the broadcaster_id !
+            "is_live": true,
+            "tag_ids": [],
+            "tags": ["English"],
+            "thumbnail_url": "https://static-cdn.jtvnw.net/jtv_user_pictures/a_seagull-profile_image-4d2d235688c7dc66-300x300.png",
+            "title": "a_seagull",
+            "started_at": "2020-03-18T17:56:00Z"
+        } ] }
+        """
+
+        resp = self._get('helix/search/channels', {
+            'query': username,
+            'first': 1,
+        })
+
+        if not resp:
+            OBS.error(f"helix/search/channels failed for username: {username}")
+            return False
+
+        if not resp.get('data') or len(resp.get('data', [])) == 0:
+            OBS.error(f"No search data returned for username: {username}")
+            return False
+
+        channel = resp.get('data')[0]
+
+        return {
+            'broadcaster_language': channel.get('broadcaster_language', 'en'),
+            'broadcaster_login': channel.get('broadcaster_login', ''),
+            'display_name': channel.get('display_name', ''),
+            'game_id': int(channel.get('game_id', -1)),
+            'game_name': channel.get('game_name', ''),
+            'broadcaster_id': int(channel.get('id', -1)), # This is the broadcaster_id !!
+            'is_live': bool(channel.get('is_live', False)),
+            'tag_ids': channel.get('tag_ids', []),
+            'tags': channel.get('tags', []),
+            'thumbnail_url': channel.get('thumbnail_url', ''),
+            'title': channel.get('title', ''),
+            'started_at': self._dt_iso_to_struct(channel.get('started_at')),
+        }
 
     # ---------------------------------------------------------------------
     # Internal Helpers
@@ -1508,8 +1755,6 @@ class TwitchApi:
     def _get(self, path, params = {}, extra_headers = {}):
         server = self._server(path)
         url = f"{server}/{path}?" + urllib.parse.urlencode(params)
-        # logging.debug(url) # TODO: remove
-        # logging.debug(extra_headers)# TODO: remove
         req = urllib.request.Request(url, headers=self._headers(extra_headers))
 
         try:
@@ -1522,10 +1767,10 @@ class TwitchApi:
                 except Exception:
                     detail = "unauthorized"
 
-            #     raise RuntimeError(f"Twitch: {detail}") from e
+            if e.code == 429: # TODO: HTAccess.??
+                detail = 'rate limited TODO: check Ratelimit-Remaining and Ratelimit-Reset headers.'
 
-            # raise
-            # logging.debug(e) # TODO: Refine
+            OBS.error(detail)
 
         return False
 
@@ -1545,6 +1790,28 @@ class TwitchApi:
             'Authorization': f"Bearer {self.token}",
             'Client-ID': self.client_id,
         } | extra
+
+    #######################################################################
+    def _dt_duration_to_struct(self, duration_secs: int) -> datetime.datetime:
+        """
+        Example:
+            Current time: 2000-01-01T00:00:00Z
+            duraction_secs = 500 (8 mins, 20 secs)
+            Returned time: 2000-01-01T00:08:20Z
+        """
+        now = datetime.datetime.now(datetime.timezone.utc)
+        t_delta = datetime.timedelta(seconds = duration_secs)
+
+        return now + t_delta
+
+    #######################################################################
+    def _dt_iso_to_struct(self, t_str: str) -> datetime.datetime:
+        """
+        Example: 2020-03-18T17:56:00Z
+        """
+        t = datetime.datetime.fromisoformat(t_str)
+
+        return t
 
 
 ###########################################################################
@@ -2233,6 +2500,7 @@ class BRBScript:
     * Web server thread handles POST successfully ->
         * calls script.on_oauth_creds(data) -> writes oauth creds to script's OBS internal settings
         * web server thread shuts down.
+        * call TwitchApi to fill in broadcaster details
 
     * script_tick() called for every rendered frame ->
         * (We do nothing.)
@@ -2274,15 +2542,15 @@ class BRBScript:
 
         # These two are initialized on an as-needed basis.
         self.irc: Optional[TwitchIRCClient] = None
-        self.oauth: Optional[TwitchOAuth] = None
+        self.oauth_server: Optional[TwitchOAuth] = None
 
     #######################################################################
     def settings_merge(self, new_settings):
         self.settings.from_data(new_settings)
 
-    #######################################################################
+    # ---------------------------------------------------------------------
     # Lifecycle Event Handlers
-    #######################################################################
+    # ---------------------------------------------------------------------
 
     #######################################################################
     def on_load(self, settings):
@@ -2292,7 +2560,6 @@ class BRBScript:
         The OBS frontend won't be loaded yet, so all we need to do is
         register our various event handlers.
         """
-
         self.reset(settings)
         OBS.event_register_handler()
         OBS.event_add(
@@ -2316,49 +2583,51 @@ class BRBScript:
         Once the OBS frontend is ready, we can check for the timer text
         source, verify oauth creds, and any other startup tasks.
         """
+        # Check for Twitch OAuth creds.
+        if not self.twitch_creds_present():
+            OBS.info('No Twitch credentials available yet.')
+            return
 
-        # TODO: Implement
+        # Validate existing token and check for a fetched Twitch user.
+        if not self.twitch_user():
+            OBS.info('Twitch OAuth token validation failed.')
+            return
 
-        # global _oauth_result
+        # Check for a fetched Twitch channel.
+        if not self.twitch_channel():
+            OBS.info('Twitch channel info fetch failed.')
+            return
 
-        # access_token = obs.obs_data_get_string(
-        #     settings,
-        #     "twitch_access_token"
-        # )
-
-        # token_type = obs.obs_data_get_string(
-        #     settings,
-        #     "twitch_token_type"
-        # )
-
-        # scopes = obs.obs_data_get_string(
-        #     settings,
-        #     "twitch_scopes"
-        # )
-
-        # if access_token:
-        #     _oauth_result = {
-        #         "access_token": access_token,
-        #         "token_type": token_type,
-        #         "scope": scopes,
-        #     }
-
-        #     print(
-        #         "[Twitch OAuth] Existing token loaded."
-        #     )
+        # Reset the on-screen timer, creating the text Source if necessary.
+        self.renderer.clear()
 
     #######################################################################
-    def on_streaming_starting(self):
+    def on_oauth_creds(self, data) -> bool:
+        """
+        Callback invoked by:
+
+        TwitchOAuthHandler.do_POST()
+            -> script.on_oauth_creds()
+
+        when the browser sends the Twitch OAuth fragment back to us.
+        """
+        if self.oauth_server.on_oauth_creds(data):
+            # TODO: Make TwitchApi calls to trade auth_token for access_token?
+            #self.settings.twitch_oauth_auth_token = self.oauth_server.oauth_result["TODO"]
+
+            self.settings.twitch_oauth_access_token = self.oauth_server.oauth_result["access_token"]
+            self.settings.twitch_oauth_expiry_at = self.oauth_server.oauth_result["expiry"]
+
+            return True
+
+        return False
+
+    #######################################################################
+    def on_streaming_starting_old_TODO_remove(self):
         """
         Script "main loop". Start up the IRC client to listen for chat
         commands.
         """
-        # TODO: Rewrite this to use our own twitch oauth token instead of OBS's
-
-        # self.settings.twitch_broadcaster_id = TODO
-        # self.settings.twitch_username = TODO
-        # self.settings.twitch_channel = TODO
-
         config = obs.obs_frontend_get_profile_config()
         token = obs.config_get_string(config, "Twitch", "Token")
 
@@ -2375,39 +2644,66 @@ class BRBScript:
         # TODO: self.irc.start()
 
     #######################################################################
+    def on_streaming_starting(self):
+        """
+        Script "main loop". Start up the IRC client to listen for chat
+        commands.
+        """
+        # Show on-screen timer.
+        self.renderer.set_text('TODO: 00:00')
+
+        # Schedule 1 second timer updates.
+        # callback must be a module method, can't be an instance method.
+        # Ref: https://docs.obsproject.com/scripting#timer_add
+        OBS.ticking_start()
+
+        # Start the IRC client.
+        self.irc = TwitchIRCClient(
+            self.twitch_channel(),
+            self.twitch_user()['name'],
+            self.settings.twitch_oauth_access_token,
+            self.on_chat,
+        )
+        self.irc.start()
+
+    #######################################################################
+    def on_timer(self):
+        """
+        Scheduled method to run every second while streaming is active.
+
+        Updates the on-screen timer.
+        """
+        self.renderer.set_text('TODO: current mm:ss')
+
+    #######################################################################
     def on_streaming_stopping(self):
         """
         Shutdown the background IRC client thread and reset script state.
         """
-        # TODO: Stop all threads.
-        # Save settings.
-        # self.irc.stop()
-        pass
+        # Hide the on-screen timer.
+        self.renderer.hide()
+
+        # Shut down any stray local http servers.
+        if self.oauth_server.server_ready.is_set():
+            self.oauth_server.server.shutdown()
+
+        # Shut down the IRC client.
+        self.irc.stop()
+
+        # TODO: Save settings?
 
     #######################################################################
-    def on_oauth_creds(self, data) -> bool:
+    def on_auto_hide(self):
         """
-        Callback invoked by
-
-        TwitchOAuthHandler.do_POST()
-            -> script.on_oauth_creds()
-
-        when the browser sends the Twitch OAuth fragment back to us.
+        Scheduled method to run some time after a brb ends to hide the
+        lingering on-screen timer.
         """
-        if self.oauth.on_oauth_creds(data):
-            #self.settings.twitch_oauth_auth_token = self.oauth.oauth_result["TODO"]
-            self.settings.twitch_oauth_expiry_at = self.oauth.oauth_result["expiry"]
-            self.settings.twitch_oauth_access_token = self.oauth.oauth_result["access_token"]
+        self.renderer.hide()
+        OBS.timer_remove_self() # Don't run again.
 
-            # TODO: Make TwitchApi calls to trade auth_token for access_token?
-
-            return True
-
-        return False
-
-    #######################################################################
+    # ---------------------------------------------------------------------
     # Chat Command Callbacks
-    #######################################################################
+    # ---------------------------------------------------------------------
 
     #######################################################################
     def on_chat(self, message: ChatMessage) -> None:
@@ -2433,32 +2729,29 @@ class BRBScript:
         Handler that's called when self.irc returns a ChatMessage with
         a !brb command.
         """
-        raise NotImplementedError
-        # TODO: Move this where it needs to go.
-        # Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5/README.md?plain=1#L472
-        # eg.source_name = obs.obs_data_get_string(settings, "source")
-        # obs.timer_remove(eg.update_text)
-        # if eg.source_name != "":
-        #     S.timer_add(eg.update_text, 1 * 1000)
+        # Validate command was sent by broadcaster or nod.
+        if not (msg.is_mod or msg.is_broadcaster):
+            self.irc.send_chat(MESSAGES.ONLY_MOD_START)
+            return
 
-        # renderer.set_text("00:00")
-        # renderer.show()
+        if self.guesses.running():
+            self.irc.send_chat(MESSAGES.ALREADY_RUNNING)
+            return
 
-        # renderer.set_text("04:31")
+        # Remove any leftover timers if this brb was started within a previous auto-hide delay.
+        OBS.stop_ticking()
 
-        # renderer.set_text(
-        #     "04:31\nWinner: @Alice -0:15"
-        # )
+        # Open up guessing.
+        self.guesses.start()
 
-        # renderer.hide()
+        # Schedule the timer.
+        OBS.start_ticking()
 
-    #######################################################################
-    def command_back(self, msg: ChatMessage):
-        """
-        Handler that's called when self.irc returns a ChatMessage with
-        a !back command.
-        """
-        raise NotImplementedError
+        # Show the on-screen timer.
+        self.renderer.show()
+
+        # Send the starting chat message.
+        self.irc.send_chat(MESSAGES.BRB_STARTED) # TODO: Format string for streamer = self.settings.twitch_username
 
     #######################################################################
     def command_at(self, msg: ChatMessage):
@@ -2466,11 +2759,51 @@ class BRBScript:
         Handler that's called when self.irc returns a ChatMessage with
         an !at command.
         """
-        raise NotImplementedError
+        if not self.guesses.running():
+            self.irc.send_chat(MESSAGES.NO_BRB)
+            return
+
+        # TODO: Parse msg.message to get MM:SS.
+        parsed_delta = TODO_with(msg) # datetime.timedelta.fromformat_or_something?
+        if not parsed_delta:
+            self.irc.send_chat(MESSAGES.BAD_GUESS) # TODO: Add format string. user = msg.username
+            return
+
+        if self.guesses.add_guess(msg.username, parsed_delta.seconds)
+            self.irc.send_chat(MESSAGES.GUESS_ACCEPTED) # TODO: Add format string for user = msg.username and guess = parsed_delta.format('%M:%S')
+            return
+
+        self.irc.send_chat(MESSAGES.ALREADY_GUESSED) # TODO: Format: user = msg.username and guess = self.state.guesses[user], which is kinda hacky. Maybe update GuessManager with a user_guessed(user) that returns the int seconds if they've guessed, and False if they haven't. That'll let us refactor above a bit too.
 
     #######################################################################
-    # OBS
-    #######################################################################
+    def command_back(self, msg: ChatMessage):
+        """
+        Handler that's called when self.irc returns a ChatMessage with
+        a !back command.
+        """
+        # Validate command was sent by broadcaster or nod.
+        if not (msg.is_mod or msg.is_broadcaster):
+            self.irc.send_chat(MESSAGES.ONLY_MOD_END)
+            return
+
+        if not self.guesses.running():
+            self.irc.send_chat(MESSAGES.NO_BRB)
+            return
+
+        # Disallow further guessing.
+        self.guesses.end()
+
+        # Stop on-screen timer from incrementing further.
+        OBS.ticking_stop()
+
+        # Schedule on-screen timer auto-hide.
+        OBS.auto_hide(self.on_auto_hide, self.settings.auto_hide_secs)
+
+        self.irc.send_chat(MESSAGES.BRB_FINISHED) # TODO: Add a format string for streamer = self.settings.twitch_username and winner = self.guesses.winner()
+
+    # ---------------------------------------------------------------------
+    # OBS Frontend Events
+    # ---------------------------------------------------------------------
 
     #######################################################################
     def tick(self):
@@ -2478,19 +2811,34 @@ class BRBScript:
         pass
 
     #######################################################################
-    def twitch_channel(self) -> str:
-        raise NotImplementedError
-        # TODO: Call TwitchApi.channel() (when available), otherwise return empty string.
-
-    #######################################################################
     def twitch_creds_present(self) -> bool:
-        raise NotImplementedError
-        # TODO: Return True when script has a non-expired access token in OBS local storage. False when no creds present in storage.
+        if not self.settings.twitch_oauth_access_token:
+            OBS.info('No Twitch OAuth token saved. Please complete the [Twitch Connect] process in the script properties.')
+            return False
+
+        if self.twitch_creds_expired():
+            return False
+
+        return True
 
     #######################################################################
     def twitch_creds_expired(self) -> bool:
-        raise NotImplementedError
-        # TODO: Return True when script has an expired access token in OBS local storage.
+        if (
+            not self.settings.twitch_oauth_expiry_at
+            or self.settings.twitch_oauth_expiry_at < datetime.datetime.now(datetime.timezone.utc) # TODO: Might need tweaking.
+        ):
+            OBS.info('Stored Twitch OAuth token has expired. Please complete the [Twitch Reconnect] process in the script properties.')
+            return False
+
+        return True
+
+    #######################################################################
+    def twitch_user_present(self) -> bool:
+        return (
+            self.settings.twitch_broadcaster_id > 0
+            and len(self.settings.twitch_username) > 0
+            and len(self.settings.twitch_channel) > 0
+        )
 
     #######################################################################
     def twitch_creds_connect(self):
@@ -2514,6 +2862,44 @@ class BRBScript:
         pass
 
     #######################################################################
+    def twitch_user(self):
+        if not self.twitch_user_present():
+            if self.twitch_creds_present():
+                validated = self._api().validate()
+                if not validated:
+                    OBS.info('Twitch OAuth token validation failed.')
+                    return False
+
+                OBS.info('Twitch OAuth token validation succeeded. Updating user settings.')
+                self.settings.twitch_broadcaster_id = validated['broadcaster_id']
+                self.settings.twitch_username = validated['login']
+                self.settings.twitch_oauth_expiry_at = validated['expires_at']
+
+        return {
+            'id': self.settings.twitch_broadcaster_id,
+            'name': self.settings.twitch_username,
+            'expires': self.settings.twitch_oauth_expiry_at,
+        }
+
+    #######################################################################
+    def twitch_channel(self) -> str:
+        """
+        Fetches and stores the OBS user's Twitch channel name on demand.
+        """
+        if not self.settings.twitch_channel:
+            if self.twitch_creds_present() and self.twitch_user_present():
+                channel = self._api().channel(self.settings.twitch_broadcaster_id)
+                if not channel:
+                    OBS.info('Twitch channel info fetch failed.')
+                    return ''
+
+                OBS.info('Twitch OAuth channel info fetch succeeded. Updating channel settings.')
+                self.settings.twitch_channel = channel['broadcaster_name']
+
+        return self.settings.twitch_channel
+
+
+    #######################################################################
     # Internal Helpers
     #######################################################################
 
@@ -2528,6 +2914,20 @@ class BRBScript:
     def oauth_flow_end(self):
         raise NotImplementedError
         # TODO: stop the background http server thread
+
+    #######################################################################
+    def _api(self) -> TwitchApi|False:
+        if not self.twitch_creds_present():
+            OBS.debug('Attempted TwitchApi access without creds set first.')
+            return False
+
+        if not self.api:
+            self.api = TwitchApi(
+                TwitchOAuth.APP_CLIENT_ID,
+                self.settings.twitch_oauth_access_token
+            )
+
+        return self.api
 
 
 ###########################################################################
