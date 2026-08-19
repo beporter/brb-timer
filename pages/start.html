@@ -12,7 +12,7 @@
       form inputs for `client_id` and `scopes`.
     -->
     <h2>Connect to Twitch</h2>
-    <form id="oauth" method="POST" action="https://id.twitch.tv/oauth2/authorize">
+    <form id="oauth" method="GET" action="https://id.twitch.tv/oauth2/authorize">
         <input type="hidden" name="client_id" value="ja5swzyzsr1euwm0e53h1sxqhk553l">
         <input type="hidden" name="response_type" value="token">
         <input type="hidden" name="scope" value="chat:edit">
@@ -26,6 +26,16 @@
 
     <script>
     (async function() {
+        const generateRandomString = (length = 16) => {
+            const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+            let result = '';
+            const randomValues = new Uint32Array(length);
+            window.crypto.getRandomValues(randomValues);
+            randomValues.forEach((value) => {
+                result += characters.charAt(value % characters.length);
+            });
+            return result;
+        }
         const inputs = document.querySelectorAll('input[type=hidden]');
 
         try {
@@ -37,7 +47,7 @@
                 } else if (key === 'redirect_uri') {
                     i.value = window.location.href.replace('start.html', 'destination.html');
                 } else if (key === 'state') {
-                    i.value = window.crypto.randomBytes(8).toString('hex')
+                    i.value = generateRandomString()
                     try {
                         await cookieStore.set({
                             name: 'twitch_oauth_state',

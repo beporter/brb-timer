@@ -16,36 +16,39 @@
 
         try {
             // Twitch implicit grant puts OAuth response in the URL #fragment...
-            // But error responses are in the query string...
-            let params = window.location.hash.substring(1) ?? window.location.search;
+            let params = Object.fromEntries(
+                new URLSearchParams(
+                    // But error responses are in the query string...
+                    window.location.hash.substring(1) ?? window.location.search
+                )
+            );
             if (!params) {
                 throw new Error('No OAuth response was received.');
             }
 
-            params = new URLSearchParams(params);
-            const data = {};
-            for (const [key, value] of params.entries()) {
-                data[key] = value;
-            }
-
-            const cookieState = cookieStore.get('twitch_oauth_state');
-            if (!cookieState || data['redirect'] !== cookieState) {
+            const cookieState = await cookieStore.get('twitch_oauth_state');
+            console.log(params, cookieState)
+            if (!cookieState || params.state !== cookieState.value) {
                 throw new Error('Returned OAuth state does not match stored cookie value.');
             }
+            delete params.state;
+            await cookieStore.delete('twitch_oauth_state');
 
-            result.textContent = JSON.stringify(data, null, 2)
-            status.textContent = 'Twitch authorization complete. Copy the access_token from above and paste it into OBS &gt; Scripts &gt; &gt; brb_timer.py &gt; Twitch Access Token';
+            result.textContent = JSON.stringify(params, null, 2);
+            status.textContent = 'Twitch authorization complete. Copy the access_token from below and paste it into OBS > Scripts > brb_timer.py > Twitch Access Token';
 
             // Remove the token from the browser's visible URL.
-            window.history.replaceState(
-                {},
-                document.title,
-                window.location.pathname
-            );
+            if (window.location.hostname !== 'localhost') {
+                window.history.replaceState(
+                    {},
+                    document.title,
+                    window.location.pathname
+                );
+            }
 
         } catch (error) {
             console.error(error);
-            status.textContent = `Authorization failed: {error.message}`;
+            status.textContent = `Authorization failed: ${error.message}`;
         }
     })();
     </script>

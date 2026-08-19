@@ -1888,6 +1888,7 @@ class TwitchOAuth:
     #     # https://dev.twitch.tv/docs/api/reference/#send-chat-message
     #     "chat:edit",
     # ]
+    KICKOFF_URL = "http://localhost:8765/start.html"
     KICKOFF_URL = "https://beporter.github.io/brb-timer/start.html"
     #DESTINATION_URL = "https://beporter.github.io/brb-timer/destination.html"
 
