@@ -169,6 +169,17 @@ class BRBSettings(object):
         return value
 
     #######################################################################
+    # def __getattr__(self, name):
+    #     """
+    #     Proxy requests for known attributes into the stored OBS data
+    #     object that's holding our script settings.
+    #     """
+    #     if not hasattr(self, name):
+    #         raise AttributeError(f"Invalid setting '{name}'.")
+    #
+    #     OBS.data_get(self.__obs_data, name)
+
+    #######################################################################
     def from_data(self, data):
         self.__obs_data = data
         # Ref: https://docs.obsproject.com/reference-settings#get-functions
@@ -742,6 +753,47 @@ class OBS:
 
         finally:
             obs.obs_data_release(data)
+
+    #######################################################################
+    # @classmethod
+    # def data_get(self, prop):
+    #     """
+    #     Ref: https://docs.obsproject.com/reference-properties#c.obs_property_get_type
+    #     """
+    #     data = None # TODO: Can we even acces the obs_data_t object for a given obs_property_t object from here??
+    #     data_type = obs.obs_property_get_type(prop)
+
+    #     # TODO: Might want to "process" some of these raw values before returning them.
+    #     match data_type:
+    #         case obs.OBS_PROPERTY_INVALID:
+    #             raise ValueError(f"Property is invalid: {prop}")
+    #         case obs.OBS_PROPERTY_BOOL:
+    #             val = obs.obs_data_get_bool(data, prop)
+    #         case obs.OBS_PROPERTY_INT:
+    #             val = obs.obs_data_get_int(data, prop)
+    #         case obs.OBS_PROPERTY_FLOAT:
+    #             val = obs.obs_data_get_double(data, prop)
+    #         case obs.OBS_PROPERTY_TEXT:
+    #             val = obs.obs_data_get_text(data, prop)
+    #         case obs.OBS_PROPERTY_PATH:
+    #             val = obs.obs_data_get_path(data, prop)
+    #         case obs.OBS_PROPERTY_LIST:
+    #             raise NotImplementedError(f"Can't fetch a full property list: {prop}")
+    #         case obs.OBS_PROPERTY_COLOR:
+    #             val = obs.obs_data_get_color(data, prop)
+    #         case obs.OBS_PROPERTY_BUTTON:
+    #             val = obs.obs_data_get_button(pdata, rop)
+    #         case obs.OBS_PROPERTY_FONT:
+    #             val = obs.obs_data_get_font(data, prop)
+    #         case obs.OBS_PROPERTY_EDITABLE_LIST:
+    #             raise NotImplementedError(f"Can't fetch a full property editable list: {prop}")
+    #         case obs.OBS_PROPERTY_FRAME_RATE:
+    #             val = obs.obs_data_get_frame_rate(data, prop)
+    #         case obs.OBS_PROPERTY_GROUP:
+    #             raise NotImplementedError(f"Can't fetch a full property group: {prop}")
+
+    #     OBS.debug(f"prop = {prop}, type = {type}, val = {val}")
+    #     return val
 
     #######################################################################
     @classmethod
