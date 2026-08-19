@@ -893,6 +893,8 @@ class OBS:
     #######################################################################
     @classmethod
     def frontend_open_url(self, url: str):
+        #webbrowser.open(self.twitch_oauth_url())
+
         obs.open_browser(url)
 
     #######################################################################
@@ -1859,546 +1861,69 @@ class TwitchOAuth:
     """
     Coordinates the entire OAuth implicit grant process against Twitch.
 
-    Starts up a background http server to receive Twitch's OAuth
-    redirect payload, then opens a web browser window inside OBS to kick
-    off the OAuth implicit authorization flow. On success, Twitch
-    redirects the web browser back to the local http server.
+    Generates the starting URL to be opened in the user's browser.
 
-    That server sends an HTML page with a Javascript payload that
-    extracts the OAuth details from the URL fragement, and POSTs them to
-    a different endpoint.
+    That URL sets up the necessary OAuth query args and the user
+    submits to id.twitch.tv.
 
-    That do_POST endpoint sends the oauth details back to us to write
-    back the script's OBS internal storage. If THAT process completes
-    successfully, the http server thread shuts down.
+    Twitch redirects back to the GH Pages hosted landing page, where
+    some JS prints out the access token.
+
+    The user copies and pastes the access token into the OBS
+    properties for this script.
+
+    The script fires Twitch API calls to validate the token, get
+    expiration information, and fetch broadcaster and channel info
+    necessary for IRC bot use.
     """
 
     # BRB Timer for Chat
     # by beporter@users.sourceforge.net
     # https://dev.twitch.tv/console/apps/ja5swzyzsr1euwm0e53h1sxqhk553l
-    APP_CLIENT_ID = "ja5swzyzsr1euwm0e53h1sxqhk553l"
-
-    AUTHORIZE_URL = "https://id.twitch.tv/oauth2/authorize"
-    TOKEN_URL = "https://id.twitch.tv/oauth2/token";
-
-    OAUTH_SCOPES = [
-        # Join chat as "you" but appear as a bot.
-        # https://dev.twitch.tv/docs/eventsub/eventsub-subscription-types/#channelchatmessage
-        # https://dev.twitch.tv/docs/api/reference/#send-chat-message
-        "user:bot",
-
-        # Read the list of channel followers.
-        # https://dev.twitch.tv/docs/api/reference#get-channel-followers
-        "moderator:read:followers",
-
-        # Read channel moderators (requires mod access to channel).
-        # https://dev.twitch.tv/docs/eventsub/eventsub-subscription-types/#channelmoderate-v2
-        "moderator:read:moderators",
-
-        # Receive and send irc chat messages.
-        # https://dev.twitch.tv/docs/api/reference/#send-chat-message
-        "chat:edit",
-
-        # Other scopes we might end up needing:
-
-        # Join channel as a bot.
-        # https://dev.twitch.tv/docs/api/reference/#send-chat-message
-        # "channel:bot,"
-
-        # Read list of moderators.
-        # https://dev.twitch.tv/docs/api/reference#get-moderators
-        # "moderation:read",
-
-        # Read list of chat participants.
-        # https://dev.twitch.tv/docs/api/reference#get-chatters
-        # "moderator:read:chatters",
-
-        # Read chat.
-        # https://dev.twitch.tv/docs/eventsub/eventsub-subscription-types/#channelchatmessage
-        # "user:read:chat",
-
-        # Write chat messages.
-        # https://dev.twitch.tv/docs/api/reference/#send-chat-message
-        # "user:write:chat",
-    ]
+    # APP_CLIENT_ID = "ja5swzyzsr1euwm0e53h1sxqhk553l"
+    # AUTHORIZE_URL = "https://id.twitch.tv/oauth2/authorize"
+    # TOKEN_URL = "https://id.twitch.tv/oauth2/token";
+    # OAUTH_SCOPES = [
+    #     # Receive and send irc chat messages.
+    #     # https://dev.twitch.tv/docs/api/reference/#send-chat-message
+    #     "chat:edit",
+    # ]
+    KICKOFF_URL = "https://beporter.github.io/brb-timer/start.html"
+    #DESTINATION_URL = "https://beporter.github.io/brb-timer/destination.html"
 
     #######################################################################
-    def __init__(self):
-        self.server = None
-        self.server_thread = None
-
-        self.server_ready = threading.Event()
-
-        # This is basically a "secret" we pass to Twitch during
-        # OAuth flow, and Twitch passes it back. Ensures we're talking
-        # to who we expect to talk to.
-        self.oauth_state = None
-
-        # The most recently obtained Twitch token information.
-        self.oauth_result = {}
-
-        # Lock protecting runtime state.
-        self.state_lock = threading.Lock()
-
-    #######################################################################
-    def start(self):
+    @classmethod
+    def twitch_kickoff_url(self) -> str:
         """
-        This is the secondary callback target (via the
-        `script.twitch_creds_*()` methods) for the "Connect Twitch"
-        buttons in script_properties().
+        Points to this project's Github Pages "start" page.
 
-        It starts up a single local http server in a background thread
-        to listen for successful OAuth redirects.
+        That page handles all of the OAuth scope itself directly, so
+        no params are strictly required here.
         """
-        # Prevent multiple simultaneous OAuth flows.
-        with self.state_lock:
-            if (
-                self.server_thread is not None
-                and self.server_thread.is_alive()
-            ):
-                OBS.debug("Local OAuth http server already running.")
-                return True
-
-            self.oauth_result = {}
-
-            # Cryptographically random state value.
-            self.oauth_state = secrets.token_urlsafe(32)
-
-        # Start HTTP server.
-        self.server_ready.clear()
-        self.server_thread = threading.Thread(
-            target=self.run_server,
-            daemon=True,
-            name=f"{SCRIPT_NAME} Twitch OAuth Receiver"
-        )
-        self.server_thread.start()
-
-        # Wait until the server has successfully bound its port.
-        if not self.server_ready.wait(timeout=2.0):
-            OBS.debug("Timed out starting callback http server.")
-
-            return
-
-        if self.server is None:
-            OBS.log("Callback server failed to start.")
-
-            return
-
-        OBS.debug("Opening Twitch authorization in browser...")
-        webbrowser.open(self.twitch_oauth_url())
+        return self.KICKOFF_URL
 
     #######################################################################
-    def twitch_oauth_url(self) -> str:
-        params = {
-            "response_type": "token",
-            "client_id": self.APP_CLIENT_ID,
-            "redirect_uri": self.server.redirect_uri(),
-            "scope": " ".join(self.OAUTH_SCOPES),
-            "state": self.oauth_state,
-        }
+    # def twitch_oauth_url(self) -> str:
+    #     """
+    #     Construct a URL to open in the OBS user's browser to start the Twitch OAuth implicit grant flow.
 
-        return (
-            self.AUTHORIZE_URL
-            + "?"
-            + urllib.parse.urlencode(params)
-        )
+    #     This script's GitHub repository hosts the kickoff and destination pages.
+    #     """
+    #     return (
+    #         self.AUTHORIZE_URL
+    #         + "?"
+    #         + urllib.parse.urlencode(self.params())
+    #     )
 
     #######################################################################
-    def run_server(self):
-        """
-        The threaded http server manager. Spun off by starter().
-        """
-        try:
-            self.server = TwitchOAuthServer()
-            self.server_ready.set()
-            OBS.info("HTTP server listening on: " + self.server.redirect_uri())
-            self.server.serve_forever()
-
-        except OSError as e:
-            OBS.debug("Could not start HTTP server:" + e)
-            self.server_ready.set()
-
-        finally:
-            if self.server is not None:
-                try:
-                    self.server.server_close()
-                    self.server_thread.join()
-                except Exception:
-                    pass
-
-            self.server = None
-            OBS.info("HTTP server stopped.")
-
-    #######################################################################
-    def stop(self) -> bool:
-        # No useable ready lock, thread or server.
-        if (
-            self.server_ready is None
-            or self.server_thread is None
-            or self.server is None
-        ):
-            return True
-
-        # Shut it down.
-        try:
-            self.server.shutdown()
-            self.server_thread.join() # Blocks until http server is down.
-            self.server_ready.clear()
-        except Exception:
-            pass
-
-        try:
-            self.server.server_close()
-        except Exception:
-            pass
-
-        return not self.server_thread.is_alive()
-
-    #######################################################################
-    def ready(self) -> bool:
-        return (
-            self.server_ready is not None
-            and self.server_ready.is_set()
-            and self.server_thread is not None
-            and self.server_thread.is_alive()
-            and self.server is not None
-        )
-
-    #######################################################################
-    def twitch_oauth_url(self) -> str:
-        params = {
-            "response_type": "token",
-            "client_id": self.APP_CLIENT_ID,
-            "redirect_uri": self.server.redirect_uri(),
-            "scope": " ".join(self.OAUTH_SCOPES),
-            "state": self.oauth_state,
-        }
-
-        return (
-            self.AUTHORIZE_URL
-            + "?"
-            + urllib.parse.urlencode(params)
-        )
-
-    #######################################################################
-    def on_oauth_creds(self, data) -> bool:
-        """
-        Callback invoked by
-
-        TwitchOAuthHandler.do_POST()
-            -> script.on_oauth_creds()
-                -> script.oauth.on_oauth_creds()
-
-        when the browser sends the Twitch OAuth fragment back to us.
-
-        This circuitous route is thanks to the inability to add
-        __init__() arguments to TwitchOAuthHandler, which is instantiated
-        separately for every http request.
-        """
-        state = data.get("state")
-        with self.state_lock:
-            # Verify the state parameter.
-            if not self.oauth_state or state != self.oauth_state:
-                OBS.debug("Returned OAuth state does't match stored state.")
-                self.oauth_result = {
-                    "error": "invalid_state"
-                }
-
-                return False
-
-            # Twitch reports authorization failures in-payload:
-            if "error" in data:
-                OBS.debug(
-                    "Authorization failed. %s: %s"
-                    % (data.get("error"), data.get("error_description", "")),
-                )
-                self.oauth_result = {
-                    "error": data.get("error", ""),
-                    "error_description": data.get("error_description", ""),
-                }
-
-                return False
-
-            access_token = data.get("access_token")
-            if not access_token:
-                OBS.debug("No access token received.")
-                self.oauth_result = {
-                    "error": "missing_access_token"
-                }
-
-                return False
-
-            self.oauth_result = {
-                "access_token": access_token,
-                "token_type": data.get("token_type", "bearer"),
-                "expiry": data.get("expiry", ""),
-                "scope": data.get("scope", ""),
-                "state": state,
-            }
-
-            OBS.info("Successfully received access token.")
-            OBS.info("Scopes: %s" % data.get("scope", ""))
-            # Don't print the actual access token to the OBS log.
-
-
-###########################################################################
-# HTTP Server
-###########################################################################
-
-class TwitchOAuthServer(http.server.ThreadingHTTPServer):
-    """
-    Minimal class for finding an available local tcp port and starting
-    up an http server, using our custom request handler class.
-    """
-
-    allow_reuse_address = True
-
-    # This host and these ports MUST be defined in the Twitch Developer
-    # Console. If none of these are available on the machine running
-    # OBS, the whole OAuth flow will fail.
-    REDIRECT_HOST = "127.0.0.1"
-    PORT_OPTIONS: list[int] = [8765, 4005, 99999]
-    REDIRECT_PATH: str = "/oauth/callback"
-
-    #######################################################################
-    def __init__(self):
-        super().__init__(
-            (self.REDIRECT_HOST, self._find_port()),
-            TwitchOAuthHandler,
-            bind_and_activate=False,
-        )
-
-    #######################################################################
-    def _find_port(self) -> int:
-        for port in self.PORT_OPTIONS:
-            try:
-                sock = socket.create_server(
-                    (self.REDIRECT_HOST, port),
-                    reuse_port = True,
-                )
-                sock.close()
-                return port
-
-            except OSError as e:
-                if e.errno == errno.EADDRINUSE:
-                    continue
-
-        raise RuntimeError(
-            'No port available for local HTTP server from configured choices: %s'
-            % " ".join(self.PORT_OPTIONS)
-        ) # or ValueError?
-
-    #######################################################################
-    def server_uri(self) -> str:
-        return f"http://{self.REDIRECT_HOST}:{self.server_port}"
-
-    #######################################################################
-    def redirect_uri(self) -> str:
-        """
-        This EXACT URI needs to be registered as the OAuth redirect URI
-        for your Twitch application.
-        """
-        return self.server_uri() + self.REDIRECT_PATH
-
-
-###########################################################################
-# HTTP Request Handler
-###########################################################################
-
-class TwitchOAuthHandler(http.server.BaseHTTPRequestHandler):
-    """
-    Handles HTTP requests made to the local web server.
-
-    Instantiated per-request by TwitchOAuthServer.
-    """
-
-    COMPLETE_PATH: str = "/oauth/complete"
-
-    NOT_FOUND_HTML: str = dedent(r"""
-        <!DOCTYPE html>
-        <html lang="en-US">
-        <head>
-            <meta charset="utf-8">
-            <title>Twitch Authorization</title>
-        </head>
-        <body>
-            <h1>404 Not Found</h1>
-        </body>
-        </html>
-    """.strip())
-
-    CALLBACK_HTML: str = dedent(r"""
-        <!DOCTYPE html>
-        <html lang="en-US">
-        <head>
-            <meta charset="utf-8">
-            <title>Twitch Authorization</title>
-        </head>
-        <body>
-            <h2>Connecting to Twitch...</h2>
-            <p id="status">Please wait.</p>
-
-            <script>
-            (async function() {
-                const status = document.getElementById("status");
-
-                try {
-                    // Twitch implicit grant puts OAuth response in the URL #fragment...
-                    // But error responses are in the query string...
-                    let params = window.location.hash.substring(1) ?? window.location.search;
-                    if (!params) {
-                        throw new Error("No OAuth response was received.");
-                    }
-
-                    params = new URLSearchParams(params);
-                    const data = {};
-                    for (const [key, value] of params.entries()) {
-                        data[key] = value;
-                    }
-
-                    // Send the fragment/query params contents to our localhost Python server.
-                    const response = await fetch('COMPLETE_PATH', {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify(data)
-                    });
-
-                    if (!response.ok) {
-                        throw new Error(
-                            "Local OAuth server returned HTTP " + response.status
-                        );
-                    }
-
-                    status.textContent = "Twitch authorization complete. You can close this window.";
-
-                    // Remove the token from the browser's visible URL.
-                    window.history.replaceState(
-                        {},
-                        document.title,
-                        window.location.pathname
-                    );
-
-                } catch (error) {
-                    console.error(error);
-                    status.textContent = "Authorization failed: " + error.message;
-                }
-            })();
-            </script>
-        </body>
-        </html>
-    """.strip())
-
-    #######################################################################
-    def do_GET(self):
-        """
-        Receive the successful Twitch OAuth redirect payload.
-
-        The Twitch auth token is passed back to us in the URL _fragment_,
-        so it is NOT available here. We return an HTML payload containing
-        JavaScript that reads window.location.hash and POSTs it back to us.
-
-        Ridiculous.
-        """
-        parsed = urllib.parse.urlparse(self.path)
-
-        # Respond to everything (except our redirect destination) with a 404.
-        if parsed.path != self.server.REDIRECT_PATH:
-            self.respond(
-                http.HTTPStatus.NOT_FOUND,
-                "text/html; charset=utf-8",
-                self.NOT_FOUND_HTML,
-            )
-
-            return
-
-        # Send the browser our minimal HTML page with JS payload to
-        # extract and POST the twitch OAuth creds.
-        self.respond(
-            http.HTTPStatus.OK,
-            "text/html; charset=utf-8",
-            self.CALLBACK_HTML
-                .replace('COMPLETE_PATH', self.COMPLETE_PATH)
-        )
-
-    #######################################################################
-    def do_POST(self):
-        """
-        Receives the OAuth information extracted from the URL fragment
-        by do_GET().
-        """
-        parsed = urllib.parse.urlparse(self.path)
-
-        # Respond to everything (except our POST destination) with a 404.
-        if parsed.path != self.COMPLETE_PATH:
-            self.json_error(http.HTTPStatus.NOT_FOUND)
-
-            return
-
-        try:
-            content_length = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(content_length)
-            data = json.loads(body.decode("utf-8"))
-
-        except Exception as e:
-            self.json_error(
-                http.HTTPStatus.BAD_REQUEST,
-                "Invalid POST data: %s" % e,
-            )
-
-            return
-
-        #global script TODO: Un-needed?
-        if not script.on_oauth_creds(data):
-            self.json_error(
-                http.HTTPStatus.INTERNAL_SERVER_ERROR,
-                "POST data rejected.",
-            )
-
-            return
-
-        self.respond(
-            http.HTTPStatus.OK,
-            "application/json",
-            b'{"ok":true}',
-        )
-
-        # We invoke server.shutdown() from another thread so we don't
-        # deadlock the HTTP request thread that's processing THIS call
-        # to do_POST().
-        if self.server is not None:
-            threading.Thread(
-                target=self.server.shutdown,
-                daemon=True
-            ).start()
-
-    #######################################################################
-    def json_error(self, code: int, detail: str = "") -> None:
-        message = detail if detail else http.HTTPStatus[code].description
-        OBS.debug(f"HTTP Response: {code} {message}")
-        self.respond(
-            code,
-            "application/json",
-            json.dumps({
-                'error': True,
-                'status': code,
-                'message': message,
-                'detail': detail,
-            })
-        )
-
-    #######################################################################
-    def respond(self, code: int, content_type: str, body: str) -> None:
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body.encode("utf-8"))
-
-    #######################################################################
-    def log_message(self, format, *args):
-        message = format % args
-        OBS.debug(message)
+    # def params(self) -> str:
+    #     return {
+    #         "response_type": "token",
+    #         "client_id": self.APP_CLIENT_ID,
+    #         "redirect_uri": self.server.redirect_uri(),
+    #         "scope": " ".join(self.OAUTH_SCOPES),
+    #         "state": self.oauth_state,
+    #     }
 
 
 ###########################################################################
@@ -2422,6 +1947,8 @@ class OBSPropsFactory:
     This class is "sparse". It only defines methods for the types of
     properties this script needs to function.
     """
+
+    #######################################################################
     def __init__(self, props_container):
         self.props = props_container
 
@@ -2446,7 +1973,8 @@ class OBSPropsFactory:
             return self.url_button(
                 f"{keyword}_twitch",
                 f"{keyword.capitalize()} Twitch",
-                getattr(script, f"twitch_creds_{keyword}"),
+                # URL and callback are mutually exclusive for our needs.
+                None, #getattr(script, f"twitch_creds_{keyword}"),
                 url,
                 text_type,
                 long_desc,
@@ -2647,8 +2175,7 @@ class BRBScript:
     guesses: GuessManager = GuessManager()
     renderer: TimerRenderer = None
 
-    # These two are initialized on an as-needed basis.
-    oauth_server: Optional[TwitchOAuth] = None
+    # This is initialized on an as-needed basis.
     irc: Optional[TwitchIRCClient] = None
 
     # Flipped on when on_obs_ready() completes successfully.
@@ -2661,7 +2188,6 @@ class BRBScript:
             self.settings.from_data(settings)
 
         self.guesses = GuessManager()
-        self.oauth_server = TwitchOAuth()
 
         # Can't initialize this till the frontend is ready.
         if self.frontend_ready:
@@ -2739,27 +2265,6 @@ class BRBScript:
         OBS.info(f"{SCRIPT_NAME} ready!")
 
     #######################################################################
-    def on_oauth_creds(self, data) -> bool:
-        """
-        Callback invoked by:
-
-        TwitchOAuthHandler.do_POST()
-            -> script.on_oauth_creds()
-
-        when the browser sends the Twitch OAuth fragment back to us.
-        """
-        if self.oauth_server.on_oauth_creds(data):
-            # TODO: Make TwitchApi calls to trade auth_token for access_token?
-            #self.settings.twitch_oauth_auth_token = self.oauth_server.oauth_result["TODO"]
-
-            self.settings.twitch_oauth_access_token = self.oauth_server.oauth_result["access_token"]
-            self.settings.twitch_oauth_expiry_at = self.oauth_server.oauth_result["expiry"]
-
-            return True
-
-        return False
-
-    #######################################################################
     def on_streaming_starting(self, props, prop):
         """
         Script "main loop". Start up the IRC client to listen for chat
@@ -2830,9 +2335,6 @@ class BRBScript:
         if self.renderer is not None:
             self.renderer.hide()
             self.renderer.set_text('--:--')
-
-        if self.oauth_server is not None and self.oauth_server.ready():
-            self.oauth_server.stop()
 
         if self.irc is not None and self.irc.running:
             self.irc.stop()
@@ -2965,10 +2467,7 @@ class BRBScript:
         """
         Ref: https://github.com/obsproject/obs-studio/blob/14e3dae77f9/frontend/oauth/TwitchAuth.cpp#L210
         """
-        OBS.debug(f"{props}, {prop}")
-        self.oauth_server.starter()
-        with self.oauth_server.server_ready.wait():
-            OBS.frontend_open_url(self.twitch_auth_url())
+        # Not needed. When connecting, we just open the start.html page's public URL and let it handle the OAuth flow.
 
     #######################################################################
     def twitch_creds_disconnect(self, props, prop):
@@ -2990,18 +2489,8 @@ class BRBScript:
         self.twitch_creds_connect()
 
     #######################################################################
-    def twitch_auth_url(self) -> str|False:
-        """
-        Local http server needs to be running for the redirect URL to
-        be present.
-        """
-        if (
-            self.oauth_server is not None
-            and self.oauth_server.ready()
-        ):
-            return self.oauth_server.twitch_oauth_url()
-
-        return False
+    def twitch_oauth_kickoff_url(self) -> str:
+        return TwitchOAuth.twitch_kickoff_url()
 
     #######################################################################
     def twitch_user(self):
@@ -3211,7 +2700,6 @@ class BRBScript:
 # Global Script Instance
 ###########################################################################
 
-ticker = None # Ugly, but the obspython bridge leaves us no better choice.
 script = BRBScript()
 
 
@@ -3222,12 +2710,12 @@ script = BRBScript()
 ###########################################################################
 def script_description():
     """
-    Uses some kind of Qt formatting.
+    Uses Qt formatting with a subset of HTML.
 
     Ref: https://doc.qt.io/archives/qt-5.15/richtext-html-subset.html
     """
     return dedent(f"""
-        <h3><a href=\"https://github.com/beporter/brb-timer\">BRB Timer</a></h3>
+        <h3><a href="https://github.com/beporter/brb-timer">BRB Timer</a></h3>
 
         <p>Let chatters guess when the streamer will return from being AFK.</p>
 
@@ -3257,11 +2745,10 @@ def script_properties():
             'TODO: reconnect explanation',
         )
     elif not script.twitch_creds_present():
-        # "connect_twitch_button" calls `script.twitch_creds_connect()` and opens a browser window.
-        # Can't specify the URL here because we don't know the local redirect port yet.
+        # "connect_twitch_button" opens a browser window.
         factory.twitch_button(
             "connect",
-            script.twitch_auth_url() or None,
+            script.twitch_oauth_kickoff_url(),
             obs.OBS_TEXT_INFO_NORMAL,
             'TODO: connect explanation',
         )
@@ -3274,8 +2761,9 @@ def script_properties():
             'TODO: disconnect explanation',
         )
 
-    # TODO: Re-enable?
-    #factory.text(obs.OBS_TEXT_DEFAULT, "channel_name")
+    factory.text(obs.OBS_TEXT_DEFAULT, "twitch_oauth_access_token", "Twitch OAuth Access Token")
+
+    # TODO: If irc client is running, show a button to restart it?
 
     #factory.text(obs.OBS_TEXT_DEFAULT, "bot_username")
 
@@ -3297,6 +2785,8 @@ def script_properties():
         1,       # step
         " secs",  # unit
     )
+
+    script.script_props = factory.props
 
     return factory.props
 
@@ -3322,23 +2812,23 @@ def script_defaults(settings):
 
     # "reconnect_twitch_button": no default
 
-    obs.obs_data_set_default_string(
-        settings,
-        "channel_name",
-        script.twitch_channel(),
-    )
+    # obs.obs_data_set_default_string(
+    #     settings,
+    #     "channel_name",
+    #     script.twitch_channel(),
+    # )
 
-    obs.obs_data_set_default_string(
-        settings,
-        "bot_username",
-        DEFAULTS.BOT_USERNAME,
-    )
+    # obs.obs_data_set_default_string(
+    #     settings,
+    #     "bot_username",
+    #     DEFAULTS.BOT_USERNAME,
+    # )
 
-    obs.obs_data_set_default_string(
-        settings,
-        "text_source",
-        "__add_new__"
-    )
+    # obs.obs_data_set_default_string(
+    #     settings,
+    #     "text_source",
+    #     "__add_new__"
+    # )
 
     obs.obs_data_set_default_int(
         settings,
@@ -3351,9 +2841,7 @@ def script_load(settings):
     """
     Called once when the script is loaded.
     """
-
     script.on_load(settings)
-
     OBS.info(f"{SCRIPT_NAME} loaded.")
 
 ###########################################################################
@@ -3367,10 +2855,15 @@ def script_update(settings):
 
     Ref: https://docs.obsproject.com/scripting#script_update
     """
-
     script.settings_merge(settings)
+    OBS.info(f"{SCRIPT_NAME} settings updated.")
 
-    OBS.info("Settings merged.")
+    #obs.obs_data_set_string(settings, "connect_twitch_button", script.twitch_auth_url())
+
+    # script_props = obs.obs_script_get_properties(script);
+    # obs.obs_properties_apply_settings(script.script_props, settings);
+
+    #obs.obs_get_config()
 
     # TODO: Propagate any prop changes out into the objects that use them. auto-hide delay for instance.
 
@@ -3388,7 +2881,8 @@ def script_save(settings):
     storage.
     """
     script.settings_merge(settings)
-
+    # TODO: If the `twitch_oauth_access_token` property was modified, and isn't empty, call TwitchApi to validate, get broadcaster_id and channel_name.
+    OBS.info(f"{SCRIPT_NAME} settings saved.")
 
 ###########################################################################
 def script_unload():
@@ -3396,5 +2890,4 @@ def script_unload():
     Called when OBS unloads the script.
     """
     script.on_unload()
-
     OBS.info(f"{SCRIPT_NAME} unloaded.")

@@ -5,7 +5,7 @@
     <title>Twitch Authorization</title>
 </head>
 <body>
-    <h2>Connecting to Twitch...</h2>
+    <h2>Back from Twitch...</h2>
     <p id="status">Please wait.</p>
     <pre><code id="result"></code></pre>
 
@@ -33,7 +33,7 @@
                 throw new Error('Returned OAuth state does not match stored cookie value.');
             }
 
-            result.textContent = JSON.stringify(data, nil, 2)
+            result.textContent = JSON.stringify(data, null, 2)
             status.textContent = 'Twitch authorization complete. Copy the access_token from above and paste it into OBS &gt; Scripts &gt; &gt; brb_timer.py &gt; Twitch Access Token';
 
             // Remove the token from the browser's visible URL.
