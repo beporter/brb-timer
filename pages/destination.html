@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+    <meta charset="utf-8">
+    <title>Twitch Authorization</title>
+</head>
+<body>
+    <h2>Connecting to Twitch...</h2>
+    <p id="status">Please wait.</p>
+    <pre><code id="result"></code></pre>
+
+    <script>
+    (async function() {
+        const status = document.getElementById('status');
+        const result = document.getElementById('result')
+
+        try {
+            // Twitch implicit grant puts OAuth response in the URL #fragment...
+            // But error responses are in the query string...
+            let params = window.location.hash.substring(1) ?? window.location.search;
+            if (!params) {
+                throw new Error('No OAuth response was received.');
+            }
+
+            params = new URLSearchParams(params);
+            const data = {};
+            for (const [key, value] of params.entries()) {
+                data[key] = value;
+            }
+
+            const cookieState = cookieStore.get('twitch_oauth_state');
+            if (!cookieState || data['redirect'] !== cookieState) {
+                throw new Error('Returned OAuth state does not match stored cookie value.');
+            }
+
+            result.textContent = JSON.stringify(data, nil, 2)
+            status.textContent = 'Twitch authorization complete. Copy the access_token from above and paste it into OBS &gt; Scripts &gt; &gt; brb_timer.py &gt; Twitch Access Token';
+
+            // Remove the token from the browser's visible URL.
+            window.history.replaceState(
+                {},
+                document.title,
+                window.location.pathname
+            );
+
+        } catch (error) {
+            console.error(error);
+            status.textContent = `Authorization failed: {error.message}`;
+        }
+    })();
+    </script>
+</body>
+</html>

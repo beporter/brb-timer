@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+    <meta charset="utf-8">
+    <title>Twitch Authorization</title>
+</head>
+<body>
+    <!--
+    - This page's public URL must be listed as an allowed redirect URL in the Twitch Developer Console.
+    - This page (quietly) accepts query params to override the default form inputs for `client_id` and `scopes`.
+    -->
+    <h2>Connect to Twitch</h2>
+    <form method="POST" action="https://id.twtitch.ev/oauth/???" id="oauth">
+        <input type="hidden" name="client_id" value="ja5swzyzsr1euwm0e53h1sxqhk553l">
+        <input type="hidden" name="scopes" value="user:bot+moderator:read:followers+moderator:read:moderators+chat:edit">
+        <input type="hidden" name="redirect" value="">
+        <input type="hidden" name="state" value="">
+        <button type="submit">Connect to Twitch</button>
+    </form>
+    <p id="status"></p>
+
+    <script>
+    (async function() {
+        const inputs = document.querySelectorAll('input[type=hidden]');
+
+        try {
+            const params = new URLSearchParams(window.location.search);
+            if (!params) {
+                return;
+            }
+            for (const i of inputs) {
+                const key = i.name;
+                if (params.has(key)) {
+                    i.value = params[key]
+                } else if (key === 'redirect') {
+                    i.value = window.location.href;
+                } else if (key === 'state') {
+                    i.value = 'todo new rando string'
+                    try {
+                        await cookieStore.set({
+                            name: 'twitch_oauth_state',
+                            value: i.value,
+                            expires: Date.now() + 60 * 10, // 10 mins
+                        });
+                    } catch (error) {
+                        console.log(`Error setting cookie: ${error}`);
+                    }
+                }
+            }
+
+            status.textContent = "Form inputs imported from query string.";
+        } catch (error) {
+            console.error(error);
+            status.textContent = "Prep failed: " + error.message;
+        }
+    })();
+    </script>
+</body>
+</html>
