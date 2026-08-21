@@ -269,6 +269,9 @@ class OBS:
         try:
             source = obs.obs_get_source_by_name(name)
 
+            if source is None:
+                raise ValueError(f"Source with name = '{name}' is not available.")
+
             yield source
 
         finally:
@@ -283,6 +286,9 @@ class OBS:
         """
         try:
             source = obs.obs_get_source_by_uuid(uuid)
+
+            if source is None:
+                raise ValueError(f"Source with uuid = '{uuid}' is not available.")
 
             yield source
 
@@ -299,11 +305,25 @@ class OBS:
         If no scene is passed, we use the currently active scene.
         """
         with scene if scene is not None else self.scene_current() as scene:
+            if scene is None:
+                raise ValueError('Scene not available.')
+
             try:
                 # TODO: Might need to switch to the `_recursive` variant.
                 source = obs.obs_scene_find_source(scene, source_name)
 
+                if source is None:
+                    raise ValueError(
+                        f"Source with name = '{source_name}' is not in scene with name = '{self.scene_name(scene)}'."
+                    )
+
                 yield source
+
+            # except Exception as e:
+            #     if type(e) is RuntimeError and str(e) == "generator didn't yield":
+            #         print('yield skipped, not an error.')
+            #     else:
+            #         raise e
 
             finally:
                 obs.obs_source_release(source)
@@ -317,6 +337,9 @@ class OBS:
         """
         try:
             source = obs.obs_source_create()
+
+            if source is None:
+                raise ValueError(f"Unable to create a new Source object.")
 
             yield source
 
@@ -534,9 +557,14 @@ class OBS:
         with scene if scene is not None else self.scene_current() as current:
             sceneitem = obs.obs_scene_add(current, source)
 
-            yield sceneitem
+            if sceneitem is None:
+                raise ValueError(
+                    "Unable to create a sceneitem for source with "
+                    f"name = '{self.source_name(source)}' in scene with "
+                    f"name = '{self.scene_name(current)}'."
+                )
 
-            return sceneitem
+            yield sceneitem
 
     #######################################################################
     @classmethod
@@ -551,9 +579,13 @@ class OBS:
             # TODO: Might need to use the recursive version of this method.
             sceneitem = obs.obs_scene_find_source(current, name)
 
-            yield sceneitem
+            if sceneitem is None:
+                raise ValueError(
+                    f"A sceneitem with name = '{name}' could not be found "
+                    f"in scene with name = '{self.scene_name(current)}'."
+                )
 
-            return sceneitem
+            yield sceneitem
 
     #######################################################################
     @classmethod
@@ -703,12 +735,25 @@ class OBS:
     #######################################################################
     @classmethod
     def transition_target(self, transition_sceneitem, visibility: str):
-        target = obs.obs_sceneitem_get_transition(
-            transition_sceneitem,
-            visibility == "show",
-        )
+        try:
+            target = obs.obs_sceneitem_get_transition(
+                transition_sceneitem,
+                visibility == "show",
+            )
 
-        return self.source_uuid(target)
+            if target is None:
+                raise ValueError(
+                    f"Could not find a {visibility} transition target "
+                    "for transition with "
+                    "id = '{self.sceneitem_id(transition_sceneitem)}'."
+                )
+
+            uuid = self.source_uuid(target)
+
+        finally:
+            obs.obs_source_release(target)
+
+        return uuid
 
     # ---------------------------------------------------------------------
     # Data
@@ -774,15 +819,17 @@ class OBS:
         with OBS.data() as d:
             # do something with `d`.
         """
-        if source_settings:
-            data = obs.obs_source_get_settings(source_settings)
-        else:
-            data = obs.obs_data_create()
-
-        if data is None:
-            return False
-
         try:
+            if source_settings:
+                data = obs.obs_source_get_settings(source_settings)
+            else:
+                data = obs.obs_data_create()
+
+            if data is None:
+                raise ValueError(
+                    f"Could not create a new data object."
+                )
+
             yield data
 
         finally:
@@ -1207,8 +1254,12 @@ class SourceGenerator:
         Returns True if a source with source_name is already present
         in the currently active scene.
         """
-        with OBS.source_name_in_scene(source_name) as source:
-            return True
+        try:
+            with OBS.source_name_in_scene(source_name) as source:
+                return (source is not None)
+
+        except ValueError:
+            pass
 
         return False
 
@@ -1349,8 +1400,14 @@ class TimerRenderer:
         Get the current visibility of the sceneitem associated with the
         configured text source.
         """
-        with self._scene_item() as si:
-            return OBS.sceneitem_visible(si)
+        try:
+            with self._scene_item() as si:
+                return OBS.sceneitem_visible(si)
+
+        except ValueError:
+            pass
+
+        return False
 
     #######################################################################
     def _set_visibility(self, visibility: bool):
@@ -1370,7 +1427,13 @@ class TimerRenderer:
         if not self.text_source_name:
             return False
 
-        yield OBS.sceneitem_by_name(self.text_source_name)
+        try:
+            yield OBS.sceneitem_by_name(self.text_source_name)
+
+        except ValueError:
+            pass
+
+        return False
 
     #######################################################################
     @contextlib.contextmanager
@@ -1381,7 +1444,13 @@ class TimerRenderer:
         if not self.text_source_name:
             return False
 
-        yield OBS.source_by_name(self.text_source_name)
+        try:
+            yield OBS.source_by_name(self.text_source_name)
+
+        except ValueError:
+            pass
+
+        return False
 
 
 ###########################################################################
