@@ -15,7 +15,7 @@
     <form id="oauth" method="GET" action="https://id.twitch.tv/oauth2/authorize">
         <input type="hidden" name="client_id" value="ja5swzyzsr1euwm0e53h1sxqhk553l">
         <input type="hidden" name="response_type" value="token">
-        <input type="hidden" name="scope" value="chat:edit">
+        <input type="hidden" name="scope" value="chat:read chat:edit">
 
         <input type="hidden" name="redirect_uri" value="__auto_populated__">
         <input type="hidden" name="state" value="__auto_populated__">
@@ -37,15 +37,21 @@
             return result;
         }
         const inputs = document.querySelectorAll('input[type=hidden]');
+        const status = document.getElementById('status');
 
         try {
             const params = new URLSearchParams(window.location.search);
             for (const i of inputs) {
                 const key = i.name;
                 if (params.has(key)) {
-                    i.value = params[key]
+                    console.log(`Setting ${key} to ${params.get(key)}`)
+                    i.value = params.get(key)
+                    status.textContent = "Form inputs imported from query string.";
                 } else if (key === 'redirect_uri') {
-                    i.value = window.location.href.replace('start.html', 'destination.html');
+                    i.value = window.location.href.replace(
+                        /start\.html(\?.*)?$/,
+                        'destination.html',
+                    );
                 } else if (key === 'state') {
                     i.value = generateRandomString()
                     try {
@@ -59,8 +65,6 @@
                     }
                 }
             }
-
-            status.textContent = "Form inputs imported from query string.";
         } catch (error) {
             console.error(error);
             status.textContent = "Prep failed: " + error.message;
