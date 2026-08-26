@@ -1,7 +1,6 @@
 """
 BRB Timer for OBS Studio
 https://github.com/beporter/brb-timer
-
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ import sys
 from textwrap import dedent
 import threading
 import time
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, TypedDict
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -49,6 +48,17 @@ except ImportError:
 
 
 ###########################################################################
+# Types
+###########################################################################
+
+type ObsButtonCallback = Callable[..., bool]
+type ObsEventCallback = Callable[..., bool]
+type ObsRouterCallback = Callable [[int], None]
+type ObsModifiedCallback = Callable[[], bool]
+type ObsTimerCallback = Callable[[], None]
+type IrcMsgCallback = Callable[[ChatMessage], None]
+
+###########################################################################
 # Constants
 ###########################################################################
 
@@ -60,7 +70,7 @@ SCRIPT_VERSION = 1.0
 
 class DEFAULTS:
     AUTO_HIDE_SECS = 120
-    TIMER_TEXT = f"{SCRIPT_NAME} init! 00:00"
+    TIMER_TEXT = "--:--"
 
 class SOURCES:
     TEXT_TIMER = f"{SCRIPT_NAME} - Timer"
@@ -81,7 +91,10 @@ class MESSAGES:
     ONLY_MOD_END = f"Only mods can end a {COMMANDS.BRB} with {COMMANDS.BACK}."
 
     # Reporting script state.
-    ALREADY_RUNNING = f"{COMMANDS.BRB} is already running! Must use {COMMANDS.BACK} first."
+    ALREADY_RUNNING = (
+        f"{COMMANDS.BRB} is already running! "
+        f"Must use {COMMANDS.BACK} first."
+    )
     NO_BRB = (
         f"There's no {COMMANDS.BRB} running. "
         f"A mod must use {COMMANDS.BRB} first."
@@ -92,8 +105,13 @@ class MESSAGES:
         f"Type `{COMMANDS.AT} MM:SS` in chat!"
     )
     BRB_FINISHED = (
-        "{streamer} is back! Winner is: {winner}. "
-        "They were {secs} second(s) off."
+        "{streamer} is back after {time}! "
+        "Winner is: {winner}. They were {diff} off."
+    )
+    BRB_FINISHED_NO_GUESSES = (
+        "{streamer} is back after {time}! "
+        "But nobody registered any "
+        f"{COMMANDS.AT} guesses so there's no winner."
     )
 
     # Guessing.
@@ -111,122 +129,43 @@ class MESSAGES:
 
 
 ###########################################################################
-# Script Settings Storage
+# Global Methods
 ###########################################################################
 
- # TODO: Review all OBS.debug() calls.
-
-@dataclass
-class BRBSettings(object):
+#--------------------------------------------------------------------------
+def dispatch(callback: Callable) -> Callable:
     """
-    Holds the script's internal settings/config data.
+    The OBS SWIG scripting bridge can't call callback methods that belong
+    to a class or instance object. It **must** be a module level bare
+    function.
 
-    Acts as a wrapper for the data that we need to have persisted by
-    OBS between launches.
+    So this method exists to give OBS a top-module-level method as a
+    wrapper for an instance method.
 
-    This class does NOT need to store anything from `script_properties()`
-    since OBS already handles that. This class is for values not intended
-    to be exposed to the user.
+    Example usage:
 
-    Typing is critical here to ensure our to_data() method calls the
-    right obs module method.
-    """
-    twitch_oauth_access_token: str = None
-    twitch_oauth_expiry_at: int = 0
+        class Events:
+            def on_text_change(props, prop, settings):
+                print('text change callback called')
 
-    twitch_broadcaster_id: int = None
-    twitch_username: str = None
-    twitch_channel: str = None
+        e = Events()
 
-    auto_hide_secs: int = DEFAULTS.AUTO_HIDE_SECS
+        def script_properties():
+            # ...
+            p = obs.obs_properties_add_text(props_obj, 'name', ...)
 
-    # Hang on to a persistent reference to OBS's internal settings
-    # for this script. Prefixed with dunder to prevent recursive
-    # serialization.
-    __obs_data = None
-
-    #######################################################################
-    def __setattr__(self, name, value):
-        """
-        Prevent the addition of arbitrary new attributes.
-
-        This means trying to set `settings.new_attr = 'value'` will
-        raise an AttributeError.
-        """
-        if not hasattr(self, name):
-            raise AttributeError(f"Invalid setting '{name}'.")
-
-        object.__setattr__(self, name, value)
-
-        return value
-
-    #######################################################################
-    # def __getattr__(self, name):
-    #     """
-    #     Proxy requests for known attributes into the stored OBS data
-    #     object that's holding our script settings.
-    #     """
-    #     if not hasattr(self, name):
-    #         raise AttributeError(f"Invalid setting '{name}'.")
-    #
-    #     OBS.data_get(self.__obs_data, name)
-
-    #######################################################################
-    def from_data(self, data):
-        self.__obs_data = data
-
-        incoming = OBS.data_get_all(data)
-        attrs = self.__attrs()
-        for name, value in incoming.items():
-            if name in attrs:
-                #OBS.debug(f"Importing {name} = {value}")
-                setattr(self, name, value)
-
-    #######################################################################
-    def to_data(self, existing = None):
-        """
-        Dump all local BRBSettings attributes to the provided obs_data_t object.
-        """
-        for name in self.__attrs():
-            value = getattr(self, name)
-            #OBS.debug(f"Setting {name} = {value}")
-            OBS.data_set(
-                existing if existing is not None else self.__obs_data,
-                name,
-                value,
+            obs.obs_property_set_modified_callback(
+                p,
+                dispatch(e.on_text_change)   # <-- wrap the real callback
             )
-
-    #######################################################################
-    def to_json(self):
-        out = {}
-        for name in self.__attrs():
-            value = getattr(self, name)
-            out[name] = value
-
-        return json.dumps(out)
-
-    #######################################################################
-    def __attrs(self) -> list[str]:
-        return [
-            attr for attr in vars(self)
-            if not callable(getattr(self, attr)) and not attr.startswith("_")
-        ]
-
-
-###########################################################################
-# Chat Message Data Container
-###########################################################################
-
-@dataclass
-class ChatMessage:
     """
-    Message passing container from the IRC client to the command parser.
-    """
-    username: str
-    display_name: str
-    message: str
-    is_mod: bool
-    is_broadcaster: bool
+    OBS.debug(f"Creating closure for: {callback.__qualname__}")
+
+    def handle(*args, **kwargs):
+        OBS.debug(f"Triggering callback: {callback.__qualname__}")
+        return callback(*args, **kwargs)
+
+    return handle
 
 
 ###########################################################################
@@ -240,71 +179,116 @@ class DT:
     Always uses UTC.
     """
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     def epoch_secs_to_dt(self, epoch_secs: int) -> datetime.datetime:
+        """
+        Convert integer seconds since Jan 1 1970 to a DateTime object.
+        """
         return datetime.datetime.fromtimestamp(
             int(epoch_secs),
             datetime.timezone.utc,
         )
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     def secs_to_delta(self, secs: int) -> datetime.timedelta:
+        """
+        Convert integer seconds to a TimeDelta object.
+        """
         return datetime.timedelta(seconds = secs)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def duration_secs_to_dt(self, duration_secs: int) -> datetime.datetime:
+    def duration_secs_to_dt(
+        self,
+        duration: int | datetime.timedelta,
+    ) -> datetime.datetime:
         """
+        Convert integer duration seconds to a DateTime object with UTC
+        time elapsed since Jan 1 1970.
+
         Example:
             Current time: 2000-01-01T00:00:00Z
-            duraction_secs = 500 (8 mins, 20 secs)
+            duraction_secs = 500 # (8 mins, 20 secs)
             Returned time: 2000-01-01T00:08:20Z
         """
-        return self.now() + datetime.timedelta(seconds = duration_secs)
+        if isinstance(duration, int):
+            duration = datetime.timedelta(seconds = duration)
 
-    #######################################################################
+        return self.now() + duration
+
+    #----------------------------------------------------------------------
     @classmethod
     def iso_str_to_dt(self, t_str: str) -> datetime.datetime:
         """
+        Convert ISO string to a UTC DateTime object.
+
         Example: "2020-03-18T17:56:00Z"
         """
-        return datetime.datetime.fromisoformat(t_str)
+        return datetime.datetime \
+            .fromisoformat(t_str) \
+            .astimezone(datetime.timezone.utc)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     def now(self) -> datetime.datetime:
         """
+        Get the current UTC time as a DateTime object.
+
         This is really annoying to have to type repeatedly. C'mon
         python, no 'now()' global?
         """
         return datetime.datetime.now(datetime.timezone.utc)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     def epoch(self) -> datetime.datetime:
+        """
+        Get a UTC DateTime object for Jan 1 1970.
+        """
         return datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     def timestamp(self) -> int:
+        """
+        Get the current number of integer seconds since Jan 1 1970.
+        """
         return int(self.now().timestamp())
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     def strfdelta(self, delta: datetime.timedelta) -> str:
-        # TODO: Move fmt stuff here.
-        return datetime.datetime.strftime(delta, '%H:%M:%S')
+        """
+        Format the provided TimeDelta object as a `[[HH:]MM:]SS` string.
+        """
+        return datetime.datetime.strftime(
+            delta,
+            self.duration_fmt(delta.total_seconds()),
+        )
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     def strpdelta(self, time_str: str) -> datetime.timedelta | False:
         """
+        Parse the provided `[[HH:]MM:]SS` string into a TimeDelta object.
+
         Ref: timedelta https://stackoverflow.com/a/51916936/70876
         Ref: regex https://stackoverflow.com/a/8318367/70876
         """
-        pattern = re.compile(r'^(?:(?:(?P<hours>[01]?\d|2[0-3]):)?(?P<minutes>[0-5]?\d):)?(?P<seconds>[0-5]?\d)$')
+        pattern = re.compile(
+            r'''
+                ^(?:
+                    (?:
+                        (?P<hours>[01]?\d|2[0-3]):
+                    )?
+                    (?P<minutes>[0-5]?\d):
+                )?
+                (?P<seconds>[0-5]?\d)$
+            ''',
+            re.X,
+        )
         parts = pattern.match(time_str)
         if parts is None:
             return False
@@ -314,13 +298,25 @@ class DT:
 
         return datetime.timedelta(**time_params)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def duration_str(self, elapsed: datetime.datetime) -> str:
+    def duration_str(
+        self,
+        elapsed: datetime.datetime | datetime.timedelta | int | float,
+    ) -> str:
         """
-        Consistent formatting for the on-screen timer and input.
+        Format the provided DateTime/TimeDelta object's hours/mins/secs
+        values, or int/float seconds, into a `[[HH:]MM:]SS` string.
         """
-        secs = elapsed.total_seconds()
+        match type(elapsed).__name__:
+            case 'int' | 'float':
+                secs = int(elapsed)
+            case 'datetime': # Ignore year/month/day.
+                secs = (elapsed.replace(year = None, month = None, day = None) - self.epoch()).total_seconds()
+            case 'timedelta':
+                secs = elapsed.total_seconds()
+            case _:
+                raise ValueError(f"Unrecognized duration format ({type(elapsed).__name__}) for value: {elapsed}")
 
         # Can't strftime a timedelta object. So just add the delta to
         # an epoch datetime object since we're only displaying
@@ -329,9 +325,17 @@ class DT:
 
         return dt.strftime(self._duration_fmt(secs))
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     def duration_fmt(secs: int) -> str:
+        """
+        Using the provided integer secs, return the shortest possible
+        formatting string.
+
+            DT.duration_fmt(45) -> '%S secs'
+            DT.duration_fmt(90) -> '%M:%S'
+            DT.duration_fmt(7200) -> '%H:%M:%S'
+        """
         if secs > 3600:
             fmt = '%H:%M:%S'
         elif secs > 60:
@@ -351,10 +355,6 @@ class OBS:
     Minimal static wrapper around the `obs` module, to keep direct
     calls out of the rest of the script.
 
-    Beside the OBS hook functions way down at the bottom of the file,
-    this class should be the only place that calls the `obs.*` module
-    directly.
-
     Any method that returns something that needs to be released later
     should be used with `with OBS.thing() as thing:`
     """
@@ -363,67 +363,55 @@ class OBS:
     # Source
     # ---------------------------------------------------------------------
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     def source_exists(self, source_name: str) -> bool:
         """
         Returns True if a source with source_name is already present
         in the currently active scene.
+
+        Ref:
         """
-        try:
-            with self.scene_current() as scene:
+        with self.scene_current() as scene:
+            try:
                 if scene is None:
                     raise ValueError('Scene not available.')
 
-                source = obs.obs_scene_find_source(scene, source_name)
-                exists = (source is not None)
+                sceneitem = obs.obs_scene_find_source(scene, source_name)
+                exists = (sceneitem is not None)
 
-        except ValueError:
-            exists = False
+            except ValueError:
+                exists = False
 
-        finally:
-            obs.obs_source_release(source)
+            finally:
+                if exists:
+                    obs.obs_sceneitem_release(sceneitem)
 
         return exists
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     @contextlib.contextmanager
-    def source_by_name(self, name: str):
+    def source_by_name(self, name: str): # yield obs_source_t
         """
         Yield the source identified by the provided name, if possible.
         """
         try:
             source = obs.obs_get_source_by_name(name)
             if source is None:
-                raise ValueError(f"Source with name = '{name}' is not available.")
+                raise ValueError(
+                    f"Source with name = '{name}' is not available."
+                )
 
             yield source
 
         finally:
             obs.obs_source_release(source)
 
-    #######################################################################
-    # @classmethod
-    # @contextlib.contextmanager
-    # def source_by_uuid(self, uuid: str):
-    #     """
-    #     Yield the source identified by the provided uuid, if possible.
-    #     """
-    #     try:
-    #         source = obs.obs_get_source_by_uuid(uuid)
-    #         if source is None:
-    #             raise ValueError(f"Source with uuid = '{uuid}' is not available.")
-
-    #         yield source
-
-    #     finally:
-    #         obs.obs_source_release(source)
-
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     @contextlib.contextmanager
-    def source_name_in_scene(self, source_name: str, scene):
+    def source_name_in_scene(self, source_name: str, scene): # scene: obs_scene_t, yield obs_source_t
         """
         Yield the source from the provided scene, if present.
 
@@ -451,15 +439,15 @@ class OBS:
         finally:
             obs.obs_source_release(source)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     @contextlib.contextmanager
     def source_create(
         self,
         source_type: str,
         source_name: str,
-        settings = None,
-    ):
+        settings = None, # obs_data_t
+    ): # yield obs_source_t
         """
         Yield a brand new source.
         """
@@ -479,16 +467,7 @@ class OBS:
             finally:
                 obs.obs_source_release(source)
 
-    #######################################################################
-    @classmethod
-    @contextlib.contextmanager
-    def data_yield(self, data):
-        try:
-            yield data
-        finally:
-            pass
-
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     @contextlib.contextmanager
     def source_create_text(
@@ -496,9 +475,9 @@ class OBS:
         source_name: str,
         text: str = "",
         source_type_id: str = None,
-    ):
+    ): # yield obs_source_t
         """
-        Create and return the first text source type available in the
+        Create and yield the first text source type available in the
         current OBS build.
         """
         # OBS uses different built-in text source IDs on different platforms.
@@ -539,71 +518,44 @@ class OBS:
 
             raise ValueError(f"Couldn't find an available text source type.")
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def source_update(self, source, changes: Dict[str, any]):
+    def source_update(
+        self,
+        source, # obs_source_t
+        changes: Dict[str, any],
+    ) -> None:
         """
         Apply settings changes to the provided source.
         """
         with self.data_set_all(None, changes) as new_settings:
             obs.obs_source_update(source, new_settings)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def source_save(self, source):
+    def source_save(self, source) -> bool: # source: obs_source_t
         """
         Save the provided source to OBS's persistent storage.
         """
         return obs.obs_save_source(source)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     # @classmethod
-    # def source_type(self, source) -> str:
+    # def source_uuid(self, source) -> str: # source: obs_source_t
     #     """
-    #     Get the "ID" (which is really a 'source type id') for the
-    #     provided source.
+    #     Get the OBS internal UUID of the provided source.
     #     """
-    #     return obs.obs_source_get_id(source)
-
-    #######################################################################
-    # @classmethod
-    # def source_name(self, source) -> str:
-    #     """
-    #     Get the display name of the provided source.
-    #     """
-    #     return obs.obs_source_get_name(source)
-
-    #######################################################################
-    @classmethod
-    def source_uuid(self, source) -> str:
-        """
-        Get the OBS internal UUID of the provided source.
-        """
-        return obs.obs_source_get_uuid(source)
-
-    #######################################################################
-    # @classmethod
-    # def source_text(self, source) -> str:
-    #     """
-    #     Get the on-screen text for the provided source.
-
-    #     Behavior is currently undefined if the source isn't a "text"
-    #     source.
-    #     """
-    #     with self.data(obs.obs_source_get_settings(source)) as settings:
-    #         text = obs.obs_data_get_string(settings, "text")
-
-    #     return text
+    #     return obs.obs_source_get_uuid(source)
 
 
     # ---------------------------------------------------------------------
     # Scene
     # ---------------------------------------------------------------------
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     @contextlib.contextmanager
-    def scene_current(self):
+    def scene_current(self): # yield obs_scene_t
         """
         Yields an obs_scene object and auto-releases afterward.
 
@@ -622,52 +574,19 @@ class OBS:
             obs.obs_source_release(scene_source)
             obs.obs_scene_release(scene)
 
-    #######################################################################
-    # @classmethod
-    # def scene_name(self, scene = None) -> str:
-    #     """
-    #     Get the display name of the provided scene.
-
-    #     Or the currently active scene if none is provided.
-    #     """
-    #     OBS.debug(f"scene = {scene}")
-    #     try:
-    #         if scene is None:
-    #             with self.scene_current() as s:
-    #                 scene_source = obs.obs_scene_get_source(s)
-    #         else:
-    #             scene_source = obs.obs_scene_get_source(scene)
-
-    #         name = self.source_name(scene_source)
-
-    #     except ValueError:
-    #         self.warn('Requested scene does not exist.')
-    #         name = ''
-
-    #     finally:
-    #         obs.obs_source_release(scene_source)
-
-    #     return name
-
-    #######################################################################
-    # @classmethod
-    # def scene_active(self, scene) -> bool:
-    #     """
-    #     Returns true when the provided scene is the currently active scene.
-    #     """
-    #     with self.scene_current() as current:
-    #         same_scene = (self.source_name(current) == self.source_name(scene))
-
-    #     return same_scene
 
     # ---------------------------------------------------------------------
     # Scene Item
     # ---------------------------------------------------------------------
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     @contextlib.contextmanager
-    def scene_add(self, scene, source):
+    def scene_add(
+        self,
+        scene, # obs_scene_t
+        source, # obs_source_t
+    ): # yield obs_sceneitem_t
         """
         Yields a sceneitem object resulting from adding the provided
         source to the provided scene.
@@ -686,38 +605,40 @@ class OBS:
         finally:
             obs.obs_sceneitem_release(sceneitem)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     @contextlib.contextmanager
-    def sceneitem_by_name(self, name: str, scene):
+    def sceneitem_by_name(
+        self,
+        name: str,
+        scene, # obs_scene_t
+    ): # yield obs_sceneitem_t
         """
-        Yields a sceneitem object matching the provided name. If no scene
-        is provided, the currently active scene will be used for the
-        search.
+        Yields a sceneitem object matching the provided name.
         """
         try:
             # TODO: Might need to use the recursive version of this method.
             sceneitem = obs.obs_scene_find_source(scene, name)
-            if sceneitem is None:
-                raise ValueError(
-                    f"A sceneitem with name = '{name}' could not be found."
-                )
+            # if sceneitem is None:
+            #     raise ValueError(
+            #         f"A sceneitem with name = '{name}' could not be found."
+            #     )
 
             yield sceneitem
 
         finally:
             obs.obs_sceneitem_release(sceneitem)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     def sceneitem_position_set(
         self,
-        sceneitem,
+        sceneitem, # obs_sceneitem_t
         alignment: int, # OBS_ALIGN_*
         pos_x: int = None,
         pos_y: int = 0,
         z_index: int = obs.OBS_ORDER_MOVE_TOP, # OBS_ORDER_*
-    ):
+    ) -> None:
         # Set on-screen alignment.
         obs.obs_sceneitem_set_alignment(sceneitem, alignment)
 
@@ -727,11 +648,7 @@ class OBS:
             obs.obs_get_video_info(vi)
             pos_x = vi.base_width
 
-        #obs.obs_sceneitem_set_pos(sceneitem, obs.vec2(pos_x, pos_y))
-        obs.obs_sceneitem_set_pos(
-                sceneitem,
-                OBS.vec2(vi.base_width, 0),
-            )
+        obs.obs_sceneitem_set_pos(sceneitem, OBS.vec2(pos_x, pos_y))
 
         # Set z-index to top.
         obs.obs_sceneitem_set_order(sceneitem, z_index)
@@ -741,15 +658,15 @@ class OBS:
         # obs.obs_sceneitem_set_bounds_alignment(sceneitem, obs.OBS_ALIGN_CENTER)
         # obs.obs_sceneitem_set_bounds(sceneitem, obs.vec2(400, 100))
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     def sceneitem_add_transition(
         self,
-        sceneitem,
-        transition_source,
+        sceneitem, # obs_sceneitem_t
+        transition_source, # obs_source_t
         visibility: str,
         duration: int = 300,
-    ):
+    ) -> None:
         # Input validation.
         if visibility not in ("show", "hide"):
             raise ValueError("visibility must be 'show' or 'hide'")
@@ -768,9 +685,13 @@ class OBS:
             duration,
         )
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def sceneitem_set_visible(self, sceneitem, show: bool):
+    def sceneitem_set_visible(
+        self,
+        sceneitem, # obs_sceneitem_t
+        show: bool,
+    ):
         """
         Tells OBS to show or hide the provided sceneitem on-screen.
 
@@ -778,28 +699,24 @@ class OBS:
         """
         return obs.obs_sceneitem_set_visible(sceneitem, show)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def sceneitem_visible(self, sceneitem) -> bool:
+    def sceneitem_visible(
+        self,
+        sceneitem, # obs_sceneitem_t
+    ) -> bool:
         """
         Returnes true if the provided sceneitem is currently visible
         on-screen.
         """
         return obs.obs_sceneitem_visible(sceneitem)
 
-    #######################################################################
-    # @classmethod
-    # def sceneitem_id(self, sceneitem) -> str:
-    #     """
-    #     Returns the OBS ID of the provided sceneitem.
-    #     """
-    #     return obs.obs_sceneitem_get_id(sceneitem)
 
     # ---------------------------------------------------------------------
     # Transition
     # ---------------------------------------------------------------------
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     @contextlib.contextmanager
     def transition_source_create(
@@ -808,7 +725,7 @@ class OBS:
         transition_type: str,
         visibility: str,
         direction: str,
-    ) -> str|False:
+    ) -> str | False:
         """
         Creates a new transition Source object with the provided settings.
 
@@ -841,9 +758,13 @@ class OBS:
         finally:
             obs.obs_source_release(transition)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def transition_duration(self, transition_sceneitem, visibility: str) -> int | None:
+    def transition_duration(
+        self,
+        transition_sceneitem, # obs_sceneitem_t
+        visibility: str,
+    ) -> int | None:
         try:
             duration = obs.obs_sceneitem_get_transition_duration(
                 transition_sceneitem,
@@ -855,46 +776,20 @@ class OBS:
 
         return duration
 
-    #######################################################################
-    # @classmethod
-    # def transition_target(self, transition_sceneitem, visibility: str) -> str | None:
-    #     """
-    #     Yields an obs_source_t object.
-    #     """
-    #     uuid = None
-    #     try:
-    #         target = obs.obs_sceneitem_get_transition(
-    #             transition_sceneitem,
-    #             visibility == "show",
-    #         )
-
-    #         if target is None:
-    #             raise ValueError(
-    #                 f"Could not find a {visibility} transition target "
-    #                 "for transition."
-    #             )
-
-    #         # uuid = self.source_uuid(target)
-    #         uuid = obs.obs_source_get_uuid(target)
-
-    #     finally:
-    #         obs.obs_source_release(target)
-
-    #     return uuid
 
     # ---------------------------------------------------------------------
     # Data
     # ---------------------------------------------------------------------
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def vec2(self, x: int, y: int):
+    def vec2(self, x: int, y: int): # -> obs_vec2_t
         v = obs.vec2()
         v.x = x
         v.y = y
         return v
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     @contextlib.contextmanager
     def text_settings(
@@ -909,7 +804,7 @@ class OBS:
         font_face: str = "Monaco",
         font_style: str = "Regular",
         font_size_px: int = 96,
-    ):
+    ): # yield obs_data_t
         """
         Helper that yields an obs_data object pre-configured with
         our stock text Source settings.
@@ -936,10 +831,13 @@ class OBS:
 
                 yield settings
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     @contextlib.contextmanager
-    def data(self, source_settings = None):
+    def data(
+        self,
+        source_settings = None, # obs_data_t
+    ): # yield obs_data_t
         """
         Helper that yields an obs_data object either from the
         passed settings, or from scratch. Auto-releases after use.
@@ -965,31 +863,65 @@ class OBS:
         finally:
             obs.obs_data_release(data)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def data_get_all(self, data) -> object:
+    @contextlib.contextmanager
+    def data_yield(
+        self,
+        data, # obs_data_t
+    ): # yield obs_data_t
         """
-        Return the provided data_t object as a python object.
+        Yield the passed data object. Does NOT release it.
+        """
+        try:
+            yield data
+        finally:
+            pass
+
+    #----------------------------------------------------------------------
+    @classmethod
+    def data_get(
+        self,
+        data, # obs_data_t
+        key: str,
+        fallback = None,
+    ) -> any:
+        all = self.data_get_all(data)
+        if key in all.keys():
+            return all[key]
+        else:
+            return fallback
+
+    #----------------------------------------------------------------------
+    @classmethod
+    def data_get_all(
+        self,
+        data, # obs_data_t
+    ) -> object:
+        """
+        Return the provided data_t object as a generic python object.
         """
         return json.loads(self.data_get_json(data))
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def data_get_json(self, data) -> str:
+    def data_get_json(
+        self,
+        data, # obs_data_t
+    ) -> str:
         """
         Return the provided data_t object as a json string.
         """
         return obs.obs_data_get_json(data)
 
-    #######################################################################
-    # @classmethod
-    # def data_apply(self, target, new_data):
-    #     obs.obs_data_apply(target, new_data)
-
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     @contextlib.contextmanager
-    def data_set_all(self, data, changes):
+    def data_set_all(
+        self,
+        data, # obs_data_t
+        changes: dict[str, any],
+    ): # yield obs_data_t
         """
         Currently only handles scalar values.
         """
@@ -999,9 +931,15 @@ class OBS:
 
             yield new_settings
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def data_set(self, data, key: str, val: any, **args):
+    def data_set(
+        self,
+        data, # obs_data_t
+        key: str,
+        val: any,
+        **args,
+    ) -> None:
         """
         Attempts to call the appropriate obs_data_set_*()` method by
         examining the python type of the supplied value. None values
@@ -1026,9 +964,15 @@ class OBS:
                 )
                 obs.obs_data_set_string(data, key, str(val))
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def data_set_default(self, data, key: str, val: any, **args):
+    def data_set_default(
+        self,
+        data, # obs_data_t
+        key: str,
+        val: any,
+        **args,
+    ) -> None:
         match type(val).__name__:
             case 'bool':
                 obs.obs_data_set_default_bool(data, key, val)
@@ -1047,37 +991,27 @@ class OBS:
                 )
                 obs.obs_data_set_default_string(data, key, str(val))
 
-    #######################################################################
-    # @classmethod
-    # def data_set_string(self, data, key: str, val: str):
-    #     obs.obs_data_set_string(data, key, val)
-
-    #######################################################################
-    # @classmethod
-    # def data_set_int(self, data, key: str, val: int):
-    #     obs.obs_data_set_int(data, key, val)
-
 
     # ---------------------------------------------------------------------
     # Events
     # ---------------------------------------------------------------------
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def event_register_router(self, router: Callable):
+    def event_register_router(self, router: ObsRouterCallback) -> None:
         """
         This method is the public interface for registering our wrapper's
         event router method (below).
         """
         obs.obs_frontend_add_event_callback(lambda ev: router(ev))
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def event_unregister_router(self, router: Callable):
+    def event_unregister_router(self, router: ObsRouterCallback) -> None:
         if router is not None:
             obs.obs_frontend_remove_event_callback(router)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
     def event_name(self, obs_const: int) -> str:
         """
@@ -1090,24 +1024,12 @@ class OBS:
             if n.startswith('OBS_FRONTEND_EVENT_')}
         return names[obs_const] if obs_const in names.keys() else 'UNRECOGNIZED_EVENT'
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def timer_add(self, callback: Callable):
+    def event_remove_self(self):
         """
-        Ref: https://docs.obsproject.com/scripting#timer_add
-        """
-        obs.timer_add(callback)
-
-    #######################################################################
-    @classmethod
-    def timer_remove(self, callback: Callable):
-        obs.timer_remove(callback)
-
-    #######################################################################
-    @classmethod
-    def timer_remove_self(self):
-        """
-        Call this from _inside_ a callback to remove the callback as a handler.
+        Call this from _inside_ a callback to remove the callback as a
+        handler.
         """
         obs.remove_current_callback()
 
@@ -1116,92 +1038,729 @@ class OBS:
     # GUI
     # ---------------------------------------------------------------------
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def frontend_open_source_props(self, name: str):
+    def properties_create(self): # -> obs_properties_t
+        return obs.obs_properties_create()
+
+    #----------------------------------------------------------------------
+    @classmethod
+    def frontend_open_source_props(self, name: str) -> None:
         with self.source_by_name(name) as source:
             obs.obs_frontend_open_source_properties(source)
+
+    #----------------------------------------------------------------------
+    @classmethod
+    def properties_show(self, props, names: list[str]) -> None:
+        for name in names:
+            OBS.debug(f"Checking for property: {name}.")
+            p = obs.obs_properties_get(props, name)
+            if p is not None:
+                OBS.debug(f"Making property {name} visible.")
+                obs.obs_property_set_visible(p, True)
+
+    #----------------------------------------------------------------------
+    @classmethod
+    def properties_hide(self, props, names: list[str]) -> None:
+        for name in names:
+            OBS.debug(f"Checking for property: {name}.")
+            p = obs.obs_properties_get(props, name)
+            if p is not None:
+                OBS.debug(f"Making property {name} hidden.")
+                obs.obs_property_set_visible(p, False)
 
 
     # ---------------------------------------------------------------------
     # Logging
     # ---------------------------------------------------------------------
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def error(self, msg: str):
+    def error(self, msg: str) -> None:
         self._log(msg, obs.LOG_ERROR)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def warn(self, msg: str):
+    def warn(self, msg: str) -> None:
         self._log(msg, obs.LOG_WARNING)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def info(self, msg: str):
+    def info(self, msg: str) -> None:
         self._log(msg, obs.LOG_INFO)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def debug(self, msg: str):
+    def debug(self, msg: str) -> None:
         self._log(msg, obs.LOG_DEBUG)
 
-    #######################################################################
-    # @classmethod
-    # def log_source(self, source):
-    #     msg = "<Source name='%s', uuid='%s', type='%s' contents='%s'>\n" % (
-    #         self.source_name(source),
-    #         self.source_uuid(source),
-    #         self.source_type(source),
-    #         self.source_text(source),
-    #     )
-    #     self._log(msg, obs.LOG_DEBUG)
-
-    #######################################################################
-    # @classmethod
-    # def log_scene(self, scene, sceneitem):
-    #     msg = "<%sScene name='%s', sceneitem_id='%s'>\n" % (
-    #         "Active " if self.scene_active(scene) else "",
-    #         self.scene_name(scene),
-    #         self.sceneitem_id(sceneitem),
-    #     )
-    #     self._log(msg, obs.LOG_DEBUG)
-
-    #######################################################################
-    # @classmethod
-    # def log_transition(self, transition_source, transition_sceneitem):
-    #     with self.transition_source(transition_sceneitem, True) as show_source:
-    #         if transition_source == show_source:
-    #             visibility = "show"
-    #         else:
-    #             visibility = "hide"
-
-    #     msg = "<Transition name='%s' uuid='%s' type='%s' visibility='%s' duration='%s' target='%s'>\n" % (
-    #         self.source_name(transition_source),
-    #         self.source_uuid(transition_source),
-    #         self.source_type(transition_source),
-
-    #         visibility,
-    #         self.transition_duration(transition_sceneitem, visibility),
-    #         self.transition_target(transition_sceneitem, visibility),
-    #     )
-    #     self._log(msg, obs.LOG_DEBUG)
-
-    #######################################################################
+    #----------------------------------------------------------------------
     @classmethod
-    def _log(self, msg: str, level: int):
-        # Grab our frame and at most three parent frames.
-        stack = inspect.stack(0)[0:3]
+    def _log(self, msg: str, level: int) -> None:
+        # Grab our frame and all parents we don't want to exclude.
+        stack = [
+            f for f in inspect.stack(0)
+            if f.frame.f_code.co_qualname not in [
+                'dispatch.<locals>.handle',
+            ]
+        ]
 
-        # The last element in the slice of 3 is the farthest-most caller.
-        # Handles the case where there's less than 2 stacks above us.
-        callers_caller_frameinfo = stack[-1]
+        # The last element in the pre-filtered slice of (up to) 3 is the
+        # farthest-most caller. This handles the case where there's less
+        # than 2 stacks above us.
+        callers_caller_frameinfo = stack[0:3][-1]
 
         # Dig into the frame details to get the fully qualified method name.
         calling_method = callers_caller_frameinfo.frame.f_code.co_qualname
 
         obs.script_log(level, f"[{calling_method}] {msg}")
+
+
+###########################################################################
+# OBS Property Factory
+###########################################################################
+
+class OBSPropsFactory:
+    """
+    This class serves a few important purposes:
+
+    1. It encapsulates the variety, order and release of the raw
+       `obs.property_*()` functions to ensure a consistent API for this
+       script to use.
+    2. Because the obspython bridges into C++ code, it's
+       unpythonic/unintuitve and hard to find what you need in the docs.
+       This class acts as a documentation bridge by demonstrating proper
+       usage of the raw `obs` module functions.
+    3. It (theoretically) consolidates calls to the `obs` module, making
+       the rest of the script easier to test in isolation.
+
+    This class is "sparse". It only defines methods for the types of
+    properties this script needs to function.
+    """
+
+    #----------------------------------------------------------------------
+    def __init__(
+        self,
+        obs_module, # python module
+        props_container, # obs_properties_t
+    ):
+        self.obs = obs_module
+        self.props = props_container
+
+    #----------------------------------------------------------------------
+    def text(
+        self,
+        name: str,
+        label: str = None,
+        type: int = obs.OBS_TEXT_DEFAULT, # OBS_TEXT_*
+        modified_callback: Optional[ObsModifiedCallback] = None,
+    ) -> None:
+        """
+        Ref: https://docs.obsproject.com/reference-properties#c.obs_property_set_modified_callback
+        """
+        p = self.obs.obs_properties_add_text(
+            self.props,
+            name,
+            label if label is not None else label.replace("_", " ").capitalize(),
+            type,
+        )
+        if modified_callback is not None:
+            OBS.debug(f"modified_callback is: {modified_callback!r}")
+            #self.obs.obs_property_set_modified_callback(p, modified_callback)
+            self.obs.obs_property_set_modified_callback(p,
+                lambda props, prop, settings: modified_callback(props, prop, settings),
+            )
+            #self.obs.obs_property_set_modified_callback(p, getattr(script, modified_callback.__name__))
+
+            ##self.obs.obs_property_set_modified_callback(p, on_list_modified)
+
+    #----------------------------------------------------------------------
+    def twitch_button(
+        self,
+        keyword: str,
+        url: str = None,
+        text_type: int = obs.OBS_TEXT_INFO_NORMAL, # OBS_TEXT_INFO_*
+        long_desc: str = '',
+    ) -> None:
+        if url is not None:
+            return self.url_button(
+                f"{keyword}_twitch",
+                f"{keyword.capitalize()} Twitch",
+                url,
+                text_type,
+                long_desc,
+            )
+        else:
+            return self.button(
+                f"{keyword}_twitch",
+                f"{keyword.capitalize()} Twitch",
+                getattr(script, f"on_twitch_{keyword}"),
+                text_type,
+                long_desc,
+            )
+
+    #----------------------------------------------------------------------
+    def url_button(
+        self,
+        base_name: str,
+        label: str,
+        url: str,
+        text_type: int = obs.OBS_TEXT_INFO_NORMAL, # OBS_TEXT_INFO_*
+        long_desc: str = '',
+        wrap: bool = True,
+    ): # -> obs_property_t
+        b = self.button(base_name, label, None, text_type, long_desc, wrap)
+        self.obs.obs_property_button_set_type(b, self.obs.OBS_BUTTON_URL)
+        self.obs.obs_property_button_set_url(b, url)
+
+        return b # In case any further modification is desired.
+
+    #----------------------------------------------------------------------
+    def button(
+        self,
+        base_name: str,
+        label: str,
+        callback: ObsButtonCallback,
+        text_type: int = obs.OBS_TEXT_INFO_NORMAL, # OBS_TEXT_INFO_*
+        long_desc: str = '',
+        wrap: bool = True,
+    ): # obs_property_t
+        """
+        Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5/src/example_class.py#L41
+        """
+        b = self.obs.obs_properties_add_button(
+            self.props,
+            f"{base_name}_button",
+            label,
+            lambda props, prop, settings: callback(props, prop, settings),
+        )
+        # Ref: https://docs.obsproject.com/reference-properties#c.obs_property_set_long_description
+        if len(long_desc) > 0:
+            i = self.obs.obs_properties_add_text(
+                self.props,
+                f"{base_name}_info",
+                long_desc,
+                self.obs.OBS_TEXT_INFO,
+            )
+            self.obs.obs_property_text_set_info_type(i, text_type)
+            self.obs.obs_property_text_set_info_word_wrap(i, wrap)
+            # self.obs.obs_property_set_long_description(b, long_desc)
+
+        return b # In case any further modification is desired.
+
+    #----------------------------------------------------------------------
+    # def text_source_list(self, name: str, desc: str, long_desc: str = '') -> None:
+    #     # Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5/src/duplicate_source.py#L51-L63
+    #     sources = self.obs.obs_enum_sources()
+    #     if sources is not None:
+    #         p = self.obs.obs_properties_add_list(
+    #             self.props,
+    #             name,
+    #             desc,
+    #             self.obs.OBS_COMBO_TYPE_LIST,
+    #             self.obs.OBS_COMBO_FORMAT_STRING,
+    #         )
+    #         self.obs.obs_property_set_modified_callback(p, lambda props, prop, settings: script.on_props_should_update(props, prop, settings))
+    #         self.obs.obs_property_list_add_string(p, "", "")
+    #         self.obs.obs_property_list_add_string(p, "(Add New)", "__add_new__")
+    #         for source in sources:
+    #             source_type_id = self.obs.obs_source_get_unversioned_id(source)
+    #             source_name = self.obs.obs_source_get_name(source)
+    #             source_uuid = self.obs.obs_source_get_uuid(source)
+    #             # There doesn't seem to be another way to identify these.
+    #             icon_type = self.obs.obs_source_get_icon_type(source_type_id)
+    #             if icon_type == self.obs.OBS_ICON_TYPE_TEXT:
+    #                 self.obs.obs_property_list_add_string(p, source_name, source_uuid)
+
+    #         i = self.obs.obs_properties_add_text(
+    #             self.props,
+    #             f"{name}_info",
+    #             long_desc,
+    #             self.obs.OBS_TEXT_INFO,
+    #         )
+    #         self.obs.obs_property_text_set_info_type(i, self.obs.OBS_TEXT_INFO_NORMAL)
+    #         self.obs.obs_property_text_set_info_word_wrap(i, True)
+
+    #         self.obs.source_list_release(sources)
+
+    #----------------------------------------------------------------------
+    def int_with_unit(
+        self,
+        name: str,
+        desc: str,
+        min: int,
+        max: int,
+        step: int,
+        unit: str = None,
+        modified_callback: Optional[ObsModifiedCallback] = None,
+    ) -> None:
+        a = self.obs.obs_properties_add_int(self.props, name, desc, min, max, step)
+        if unit is not None:
+            self.obs.obs_property_int_set_suffix(a, unit)
+        if modified_callback is not None:
+            self.obs.obs_property_set_modified_callback(a, lambda props, prop, settings: modified_callback(props, prop, settings))
+
+
+###########################################################################
+# Source Generator (Text Source with show/hide scene_item transitions)
+###########################################################################
+
+class SourceGenerator:
+    """
+    Creates an OBS text source in the currently active OBS scene if it
+    does not already exist.
+    """
+
+    SHOW_TRANSITION_TYPE = "slide_transition"
+    HIDE_TRANSITION_TYPE = "slide_transition"
+    SHOW_TRANSITION_DIR = "left"
+    HIDE_TRANSITION_DIR = "right"
+    TRANSITION_DURATION_MS = 300
+
+    def __init__(
+        self,
+        source_name,
+        text = "hello world",
+        text_source_id = None,
+    ):
+        self.text_source_name = source_name
+        self.text = text
+        self.text_source_id = text_source_id
+
+    #----------------------------------------------------------------------
+    @classmethod
+    def create_source(
+        self,
+        source_name: str,
+        text: str = "hello world",
+        text_source_id: str = None, # Differs by platform. See OBS.source_create_text
+    ) -> bool:
+        """
+        If we were provided a source_name that doesn't exist in the
+        active scene, create one and add it into the active scene using
+        some defaults that the OBS user can subsequently tweak.
+
+        Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5a57/src/add_nested.py#L16
+        Ref: https://github.com/obsproject/obs-studio/blob/32.0.4/plugins/text-freetype2/text-freetype2.c#L170
+        """
+        if OBS.source_exists(source_name):
+            OBS.info(
+                f"Source '{source_name}' already exists in current scene."
+                "Nothing created."
+            )
+            return False
+
+        # Create the text source for the timer display
+        with OBS.source_create_text(
+            source_name,
+            text,
+            text_source_id,
+        ) as source:
+            OBS.source_save(source)
+
+            # Add source to scene.
+            # Ref: https://github.com/obsproject/obs-studio/blob/32.0.4/libobs/obs.h#L153
+            with OBS.scene_current() as scene:
+                if scene is None:
+                    OBS.error("Current frontend source is not an OBS scene.")
+                    return False
+
+                # Add transitions to scene item.
+                with OBS.scene_add(scene, source) as sceneitem:
+                    if sceneitem is None:
+                        OBS.error(
+                            f"Could not add source '{source_name}' to current scene.",
+                        )
+                        return False
+
+                    OBS.sceneitem_position_set(
+                        sceneitem,
+                        # These constants don't work for some reason.
+                        #obs.OBS_ALIGN_RIGHT | obs.OBS_ALIGN_TOP,
+                        ((1 << 1) | (1 << 2))
+                    )
+
+                    with OBS.transition_source_create(
+                        SOURCES.TRANSITION_SHOW,
+                        "slide_transition",
+                        'show',
+                        "left",
+                    ) as show_trans:
+                        OBS.source_save(show_trans)
+                        OBS.sceneitem_add_transition(
+                            sceneitem,
+                            show_trans,
+                            'show',
+                            self.TRANSITION_DURATION_MS,
+                        )
+
+                    with OBS.transition_source_create(
+                        SOURCES.TRANSITION_HIDE,
+                        "slide_transition",
+                        'hide',
+                        "right",
+                    ) as hide_trans:
+                        OBS.source_save(hide_trans)
+                        OBS.sceneitem_add_transition(
+                            sceneitem,
+                            hide_trans,
+                            'hide',
+                            self.TRANSITION_DURATION_MS,
+                        )
+
+        return True
+
+
+###########################################################################
+# Twitch API Wrapper
+###########################################################################
+
+class TwitchApi:
+    """
+    Encapsulate http calls to Twitch's APIs.
+    """
+
+    #----------------------------------------------------------------------
+    def __init__(self, client_id: str, token: str):
+        self.client_id = client_id
+        self.token = token
+
+    #----------------------------------------------------------------------
+    def validate(self) -> Dict[str, any] | False:
+        """
+        Pass an oauth token to determine if it's still valid, and who
+        it belongs to.
+
+        Ref: https://dev.twitch.tv/docs/authentication/validate-tokens#how-to-validate-a-token
+        """
+        resp = self._get('oauth2/validate')
+
+        if not resp:
+            OBS.error("oauth2/validate failed.")
+            return False
+
+        if not resp['login']:
+            OBS.error("OAuth token is not attached to a user.")
+            return False
+
+        if not set(TwitchOAuth.OAUTH_SCOPES).issubset(resp['scopes']):
+            missing_scopes = ", ".join(set(TwitchOAuth.OAUTH_SCOPES) - set(resp['scopes']))
+            OBS.error(
+                "OAuth token is lacking necessary scopes: (%s)" % (missing_scopes),
+            )
+            return False
+
+        return {
+            'client_id': resp.get('client_id', ''),
+            'login': resp.get('login', ''),
+            'scopes': resp.get('scopes', []),
+            'broadcaster_id': int(resp.get('user_id', '')),
+            'expires_in': resp.get('expires_in', None), # int seconds
+            'expires_at': DT.duration_secs_to_dt(resp.get('expires_in', None)), # datetime
+        }
+
+    #----------------------------------------------------------------------
+    def channel(self, broadcaster_id: int) -> Dict[str, any]:
+        """
+        Get the provided broadcaster's channel details.
+
+        Ref: https://dev.twitch.tv/docs/api/reference#get-channel-information
+        """
+        resp = self._get('helix/channels', {'broadcaster_id': broadcaster_id})
+
+        if not resp:
+            OBS.error(
+                "helix/channels failed for "
+                f"broadcaster_id: {broadcaster_id}"
+            )
+            return False
+
+        if not resp.get('data') and resp.get('data', []).get(0):
+            OBS.error(
+                "No channel data returned for "
+                f"broadcaster_id: {broadcaster_id}"
+            )
+            return False
+
+        channel = resp.get('data')[0]
+
+        return {
+            'broadcaster_id': int(channel.get('broadcaster_id', -1)),
+            'broadcaster_login': channel.get('broadcaster_login', ''),
+            'broadcaster_name': channel.get('broadcaster_name', ''),
+            'broadcaster_language': channel.get('broadcaster_language', 'en'),
+            'game_id': int(channel.get('game_id', -1)),
+            'game_name': channel.get('game_name', ''),
+            'title': channel.get('title', ''),
+            'tags': channel.get('tags', []),
+            'content_classification_labels': channel.get('content_classification_labels', []),
+            'is_branded_content': bool(channel.get('is_branded_content', False)),
+        }
+
+    # ---------------------------------------------------------------------
+    # Internal Helpers
+    # ---------------------------------------------------------------------
+
+    #----------------------------------------------------------------------
+    def _get(
+            self,
+            path: str,
+            params: dict[str, str|int] = {},
+            extra_headers: dict[str, str|int] = {},
+        ) -> object | False:
+        server = self._server(path)
+        url = f"{server}/{path}?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers=self._headers(extra_headers))
+
+        try:
+            with urllib.request.urlopen(req) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                try:
+                    detail = json.load(e["message"])
+                except Exception:
+                    detail = "unauthorized"
+
+            # Ref: https://dev.twitch.tv/docs/api/guide/#twitch-rate-limits
+            if e.code == http.HTTPStatus.TOO_MANY_REQUESTS:
+                total = e.headers.get('Ratelimit-Limit')
+                remaining = e.headers.get('Ratelimit-Remaining')
+                reset = DT.epoch_secs_to_dt(e.headers.get('Ratelimit-Reset'))
+                detail = (
+                    f"Rquest for {e.url()} was rate limited. "
+                    f"({remaining}/{total} requests remaining. "
+                    f"Reset at {reset.strptime()}.)"
+                )
+
+            OBS.error(detail)
+
+        return False
+
+    #----------------------------------------------------------------------
+    def _server(self, path: str) -> str:
+        match path.split('/', 2)[0]:
+            case 'oauth2':
+                return 'https://id.twitch.tv'
+            case _:
+                return 'https://api.twitch.tv'
+
+    #----------------------------------------------------------------------
+    def _headers(
+        self,
+        extra: dict[str, str|int] = {},
+    ) -> dict[str, str|int]:
+        return {
+            'User-Agent': f"{SCRIPT_NAME} v{SCRIPT_VERSION}",
+            'Accept': 'application/json',
+            'Authorization': f"Bearer {self.token}",
+            'Client-ID': self.client_id,
+        } | extra
+
+
+###########################################################################
+# Twitch OAuth Wrapper
+###########################################################################
+
+class TwitchOAuth:
+    """
+    Coordinates the entire OAuth implicit grant process against Twitch.
+
+    - Generates the starting URL to be opened in the user's browser.
+    - That URL sets up the necessary OAuth query args and the user
+      submits to id.twitch.tv.
+    - Twitch redirects back to the GH Pages hosted landing page, where
+      some JS prints out the access token.
+    - The user copies and pastes the access token into the OBS
+      properties for this script.
+    - The script fires Twitch API calls to validate the token, get
+      expiration information, and fetch broadcaster and channel info
+      necessary for IRC bot use.
+    """
+
+    # BRB Timer for Chat
+    # by beporter@users.sourceforge.net
+    # https://dev.twitch.tv/console/apps/ja5swzyzsr1euwm0e53h1sxqhk553l
+    APP_CLIENT_ID = "ja5swzyzsr1euwm0e53h1sxqhk553l"
+    OAUTH_SCOPES = [
+        # Receive and send irc chat messages.
+        # https://dev.twitch.tv/docs/api/reference/#send-chat-message
+        "chat:read",
+        "chat:edit",
+    ]
+    KICKOFF_URL = "https://beporter.github.io/brb-timer/start.html"
+
+    #----------------------------------------------------------------------
+    def __init__(self, settings: BRBSettings):
+        self.settings = settings
+
+    #----------------------------------------------------------------------
+    @classmethod
+    def kickoff_url(self) -> str:
+        """
+        Points to this project's Github Pages "start" page.
+
+        That page handles all of the OAuth scope itself directly, so
+        no params are strictly required here.
+        """
+        # TODO: Toggle on debug: `./local_http.sh` --> "http://localhost:8765/start.html"
+        return self.KICKOFF_URL
+
+    #----------------------------------------------------------------------
+    def creds_present(self) -> bool:
+        if (
+            self.settings.twitch_oauth_access_token is None
+            or len(self.settings.twitch_oauth_access_token) == 0
+            or self.settings.twitch_oauth_expiry_at is None
+            or self.settings.twitch_oauth_expiry_at == 0
+        ):
+            OBS.info('No Twitch OAuth token saved.')
+            return False
+
+        if self.creds_expired():
+            return False
+
+        return True
+
+    #----------------------------------------------------------------------
+    def creds_expired(self) -> bool:
+        if isinstance(self.settings.twitch_oauth_expiry_at, datetime.datetime):
+            expiry = self.settings.twitch_oauth_expiry_at
+            self.settings.twitch_oauth_expiry_at = int(expiry.timestamp())
+        elif isinstance(self.settings.twitch_oauth_expiry_at, str):
+            expiry = DT.iso_str_to_dt(self.settings.twitch_oauth_expiry_at)
+            self.settings.twitch_oauth_expiry_at = int(expiry.timestamp())
+        else:
+            expiry = DT.epoch_secs_to_dt(int(self.settings.twitch_oauth_expiry_at))
+
+        if (
+            self.settings.twitch_oauth_access_token is not None
+            and self.settings.twitch_oauth_expiry_at is not None
+            and self.settings.twitch_oauth_expiry_at != 0
+            and expiry < DT.now()
+        ):
+            OBS.info('Stored Twitch OAuth token has expired.')
+            return True
+
+        return False
+
+    #----------------------------------------------------------------------
+    def creds_set(self, access_token: str, expires_at: int = 0) -> bool:
+        self.clear_settings() # Have to invalidate existing api instance when token changes.
+
+        # Cast expires at from string,
+        if isinstance(self.settings.twitch_oauth_expiry_at, str):
+            expires_at = DT.iso_str_to_dt(self.settings.twitch_oauth_expiry_at)
+
+        # or datetime oject, to int.
+        if isinstance(expires_at, datetime.datetime):
+            expires_at = int(expires_at.timestamp())
+
+        self.settings.twitch_oauth_access_token = access_token.strip()
+        self.settings.twitch_oauth_expiry_at = expires_at
+
+        if not self.user_get():
+            OBS.error("New Twitch access token is not valid. Removing existing settings.")
+            self.clear_settings()
+
+            return False
+
+        OBS.info("New Twitch access token is valid. Repopulating user and channel info.")
+        self.channel_get()
+
+        return True
+
+    #----------------------------------------------------------------------
+    def user_present(self) -> bool:
+        return (
+            self.settings.twitch_broadcaster_id > 0
+            and len(self.settings.twitch_username) > 0
+        )
+
+    #----------------------------------------------------------------------
+    def user_get(self) -> Dict[str, any] | False:
+        if not self.user_present():
+            if self.creds_present():
+                validated = self._api().validate()
+                if not validated:
+                    OBS.info('Twitch OAuth token validation failed.')
+
+                    return False
+
+                OBS.info('Twitch OAuth token validation succeeded.')
+                self.settings.twitch_oauth_expiry_at = int(validated['expires_at'].timestamp())
+                self.user_set(validated['broadcaster_id'], validated['login'])
+
+        return {
+            'id': self.settings.twitch_broadcaster_id,
+            'name': self.settings.twitch_username,
+        }
+
+    #----------------------------------------------------------------------
+    def user_set(self, broadcaster_id: int, username: str) -> bool:
+        self.settings.twitch_broadcaster_id = broadcaster_id
+        self.settings.twitch_username = username
+
+        return True
+
+    #----------------------------------------------------------------------
+    def channel_present(self) -> bool:
+        return (
+            self.settings.twitch_broadcaster_id > 0
+            and len(self.settings.twitch_channel) > 0
+        )
+
+    #----------------------------------------------------------------------
+    def channel_get(self) -> str:
+        """
+        Fetches and stores the OBS user's Twitch channel name on demand.
+
+        This is initially called really early for the script's OBS GUI
+        properties, so we do a bit more guarding/setup.
+        """
+        if not self.channel_present():
+            if self.creds_present() and self.user_present():
+                channel = self._api().channel(self.settings.twitch_broadcaster_id)
+                if not channel:
+                    OBS.error('Twitch channel info fetch failed.')
+
+                    return ''
+
+                OBS.info('Twitch OAuth channel info fetch succeeded.')
+                self.channel_set(channel['broadcaster_name'])
+
+        return self.settings.twitch_channel
+
+    #----------------------------------------------------------------------
+    def channel_set(self, channel: str) -> bool:
+        self.settings.twitch_channel = channel
+
+        return True
+
+    #----------------------------------------------------------------------
+    def clear_settings(self) -> None:
+        self.settings.twitch_oauth_access_token = ''
+        self.settings.twitch_oauth_expiry_at = 0
+
+        self.settings.twitch_broadcaster_id = -1
+        self.settings.twitch_username = ''
+        self.settings.twitch_channel = ''
+
+        self.api = None
+
+    #----------------------------------------------------------------------
+    def _api(self) -> TwitchApi | False:
+        if not self.creds_present():
+            OBS.warn('Attempted TwitchApi access without creds set first.')
+            return False
+
+        if not self.api:
+            self.api = TwitchApi(
+                self.APP_CLIENT_ID,
+                self.settings.twitch_oauth_access_token
+            )
+
+        return self.api
 
 
 ###########################################################################
@@ -1244,7 +1803,7 @@ class TwitchIRCClient:
         channel: str,
         username: str,
         oauth: str,
-        callback: Callable[[ChatMessage], None],
+        callback: IrcMsgCallback,
     ):
         self.channel = channel.lower().lstrip("#")
         self.username = username
@@ -1257,12 +1816,8 @@ class TwitchIRCClient:
         self.running = False
         self.thread = None
 
-    # ---------------------------------------------------------------------
-    # Public API
-    # ---------------------------------------------------------------------
-
-    #######################################################################
-    def start(self):
+    #----------------------------------------------------------------------
+    def start(self) -> None:
         if self.running:
             return
 
@@ -1273,52 +1828,48 @@ class TwitchIRCClient:
             name=f"{SCRIPT_NAME}-TwitchIRC",
         )
 
+        OBS.debug("Starting IRC thread.")
+
         self.thread.start()
 
-    #######################################################################
-    def stop(self):
+    #----------------------------------------------------------------------
+    def stop(self) -> None:
         self.running = False
 
         try:
             if self.socket:
+                OBS.debug("Closing irc socket.")
+                self.socket.shutdown(socket.SHUT_RDWR)
                 self.socket.close()
-                self.thread.join()
-        except Exception:
+                #self.thread.join() # wait for the thread to terminate.
+            if self.thread.is_alive():
+                OBS.debug("Stopping background thread.")
+
+        except Exception as e:
+            OBS.debug(f"Failed to close socket: {e}")
             pass
 
-    #######################################################################
-    def send_chat(self, message: str):
+    #----------------------------------------------------------------------
+    def send_chat(self, message: str) -> None:
         self._send_raw(f"PRIVMSG #{self.channel} :{message}")
 
     # ---------------------------------------------------------------------
     # Internal Helpers
     # ---------------------------------------------------------------------
 
-    #######################################################################
-    def _receive_loop(self):
-        while self.running:
-            try:
-                self._connect()
-                while self.running:
-                    line = self.reader.readline()
-                    if not line:
-                        raise ConnectionError("EOF")
+    #----------------------------------------------------------------------
+    def _connect(self) -> None:
+        """
+        Establish an SSL-wrapped socket connection.
 
-                    self._handle_line(line.rstrip())
+        Ref: https://stackoverflow.com/a/23615951/70876
+        """
+        # if self.running:
+        #     OBS.debug("Already connected to irc.")
+        #     return
 
-            except Exception as ex:
-                OBS.warn(f"TwitchIRC: {ex}")
-                try:
-                    if self.socket:
-                        self.socket.close()
-                except Exception:
-                    pass
-
-                time.sleep(self.RECONNECT_DELAY)
-
-    #######################################################################
-    def _connect(self):
-        raw = socket.create_connection((self.HOST, self.PORT), timeout=15)
+        OBS.debug("Connecting to irc...")
+        raw = socket.create_connection((self.HOST, self.PORT), timeout=60)
         ctx = ssl.create_default_context()
         self.socket = ctx.wrap_socket(raw, server_hostname=self.HOST)
         self.reader = self.socket.makefile(
@@ -1326,32 +1877,71 @@ class TwitchIRCClient:
             encoding="utf-8",
             newline="\r\n",
         )
-
-        self._send_raw(f"PASS oauth:{self.oauth}")
-        self._send_raw(f"NICK {self.username}")
+        #self.socket.settimeout(None)
 
         # Ref: https://dev.twitch.tv/docs/chat/irc
-        self._send_raw("CAP REQ :twitch.tv/tags")
-        self._send_raw("CAP REQ :twitch.tv/commands")
-
+        self._send_raw("CAP REQ :twitch.tv/tags twitch.tv/commands")
+        self._send_raw(f"PASS oauth:{self.oauth}")
+        self._send_raw(f"NICK {self.username}")
         self._send_raw(f"JOIN #{self.channel}")
+        OBS.debug("connected.")
 
-    #######################################################################
-    def _handle_line(self, line: str):
+    #----------------------------------------------------------------------
+    def _receive_loop(self) -> None:
+        OBS.debug("Starting _receive_loop.")
+        while self.running:
+            try:
+                self._connect()
+                while self.running:
+                    OBS.debug("Reading line...")
+                    line = self.reader.readline()
+                    if not line:
+                        #continue
+                        raise ConnectionError("EOF")
+
+                    OBS.debug(f"Handling line: {line}")
+                    self._handle_line(line.rstrip())
+
+            except ConnectionError:
+                pass
+
+            except Exception as ex:
+                OBS.warn(f"TwitchIRC: {ex}")
+                try:
+                    if self.socket:
+                        OBS.debug("Closing socket.")
+                        self.socket.close()
+                except Exception as e:
+                    OBS.debug(f"Failed to close socket: {e}")
+
+                OBS.debug(f"Sleeping for {self.RECONNECT_DELAY} secs.")
+                time.sleep(self.RECONNECT_DELAY)
+
+    #----------------------------------------------------------------------
+    def _handle_line(self, line: str) -> None:
         if line.startswith("PING"):
+            OBS.debug(f"Answering PING with PONG.")
             self._send_raw(line.replace("PING", "PONG", 1))
+            return
 
+        if "NOTICE * :Login unsuccessful" in line:
+            OBS.debug("IRC auth rejected.")
+            self.stop()
             return
 
         if " PRIVMSG " not in line:
+            #OBS.debug(f"Not a privmsg-- ignoring.")
             return
 
+        OBS.debug(f"Processing privmsg: {line}")
         msg = self._parse_privmsg(line)
+        #OBS.debug(f"Parsed message: {msg}")
         if msg:
-            self.callback(ChatMessage(msg))
+            OBS.debug(f"Triggering callback for: {msg}")
+            self.callback(msg)
 
-    #######################################################################
-    def _parse_privmsg(self, line: str) -> Optional[ChatMessage]:
+    #----------------------------------------------------------------------
+    def _parse_privmsg(self, line: str) -> ChatMessage | None:
         try:
             tags_raw, remainder = line.split(" ", 1)
             tags = self._parse_tags(tags_raw[1:])
@@ -1362,22 +1952,23 @@ class TwitchIRCClient:
             message = message[1:]
 
             return ChatMessage(
-                username=username,
-                display_name=tags.get("display-name", username),
-                message=message,
-                is_mod=(tags.get("mod") == "1"),
-                is_broadcaster=("broadcaster/1" in tags.get("badges", "")),
+                username,
+                tags.get("display-name", username),
+                message,
+                (tags.get("mod") == "1"), # is_mod
+                ("broadcaster/1" in tags.get("badges", "")), # is_broadcaster
             )
 
         except Exception:
             return None
 
-    #######################################################################
-    def _send_raw(self, line: str):
+    #----------------------------------------------------------------------
+    def _send_raw(self, line: str) -> None:
         with self.send_lock:
+            OBS.debug(f"Sending line: {line}")
             self.socket.sendall((line + "\r\n").encode("utf-8"))
 
-    #######################################################################
+    #----------------------------------------------------------------------
     @staticmethod
     def _parse_tags(raw: str) -> Dict[str, str]:
         result = {}
@@ -1391,182 +1982,19 @@ class TwitchIRCClient:
 
 
 ###########################################################################
-# Source Generator (Text Source with show/hide scene_item transitions)
+# Chat Message Data Container
 ###########################################################################
 
-class SourceGenerator:
+@dataclass
+class ChatMessage(TypedDict):
     """
-    Creates an OBS text source in the currently active OBS scene if it
-    does not already exist.
+    Message passing container from the IRC client to the command parser.
     """
-
-    SHOW_TRANSITION_TYPE = "slide_transition"
-    HIDE_TRANSITION_TYPE = "slide_transition"
-    SHOW_TRANSITION_DIR = "left"
-    HIDE_TRANSITION_DIR = "right"
-    TRANSITION_DURATION_MS = 300
-
-    def __init__(
-        self,
-        source_name,
-        text = "hello world",
-        text_source_id = None,
-    ):
-        self.text_source_name = source_name
-        self.text = text
-        self.text_source_id = text_source_id
-
-    #######################################################################
-    def create_source(self) -> bool:
-        """
-        If we were provided a text_source_name that doesn't exist in the
-        active scene, create one and add it into the active scene using
-        some defaults that the OBS user can subsequently tweak.
-
-        Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5a57/src/add_nested.py#L16
-        Ref: https://github.com/obsproject/obs-studio/blob/32.0.4/plugins/text-freetype2/text-freetype2.c#L170
-        """
-        if OBS.source_exists(self.text_source_name):
-            OBS.info(
-                "Source '%s' already exists in current scene."
-                "Nothing created."
-                % (self.source_name),
-            )
-            return False
-
-        # Create the text source for the timer display
-        with OBS.source_create_text(
-            self.text_source_name,
-            self.text,
-            self.text_source_id,
-        ) as source:
-            OBS.source_save(source)
-            text_source_uuid = OBS.source_uuid(source)
-
-            # Add source to scene.
-            # Ref: https://github.com/obsproject/obs-studio/blob/32.0.4/libobs/obs.h#L153
-            with OBS.scene_current() as scene:
-                if scene is None:
-                    OBS.debug("Current frontend source is not an OBS scene.")
-                    return False
-
-                # Add transitions to scene item.
-                with OBS.scene_add(scene, source) as sceneitem:
-                    if sceneitem is None:
-                        OBS.debug(
-                            f"Could not add source '{self.text_source_name}' to current scene.",
-                        )
-                        return False
-
-                    OBS.sceneitem_position_set(
-                        sceneitem,
-                        #obs.OBS_ALIGN_RIGHT | obs.OBS_ALIGN_TOP,
-                        ((1 << 1) | (1 << 2))
-                    )
-
-                    with OBS.transition_source_create(
-                        SOURCES.TRANSITION_SHOW,
-                        "slide_transition",
-                        'show',
-                        "left",
-                    ) as show_trans:
-                        OBS.sceneitem_add_transition(
-                            sceneitem,
-                            show_trans,
-                            'show',
-                            self.TRANSITION_DURATION_MS,
-                        )
-
-                    with OBS.transition_source_create(
-                        SOURCES.TRANSITION_HIDE,
-                        "slide_transition",
-                        'hide',
-                        "right",
-                    ) as hide_trans:
-                        OBS.sceneitem_add_transition(
-                            sceneitem,
-                            hide_trans,
-                            'hide',
-                            self.TRANSITION_DURATION_MS,
-                        )
-
-                    # OBS.debug("Created OBS source:")
-                    # OBS.log_source(source)
-                    # OBS.log_scene(scene)
-                    # OBS.log_transition(OBS.source_by_uuid(show_uuid), sceneitem)
-                    # OBS.log_transition(OBS.source_by_uuid(hide_uuid), sceneitem)
-
-        return True
-
-
-###########################################################################
-# Timer Renderer
-###########################################################################
-
-class TimerRenderer:
-    """
-    This class handles the OBS display of the on-screen timer.
-
-    If the targeted text source doesn't already exist in the active
-    scene, it'll be generated.
-    """
-
-    #######################################################################
-    def __init__(self, text_source_name: str):
-        self.text_source_name = text_source_name
-
-    #######################################################################
-    def set_text(self, text: str) -> None:
-        """
-        Update the on-screen timer with the provided text.
-        """
-        if not self.text_source_name:
-            OBS.error(f"No text_source_name is set.")
-            return False
-
-        with OBS.source_by_name(self.text_source_name) as source:
-            if source is None:
-                OBS.error(f"Couldn't update on-screen text for source named '{self.text_source_name}'.")
-                return False
-
-            changes = {
-                'text': text,
-            }
-            OBS.source_update(source, changes)
-            OBS.info(f"Set timer text source '{self.text_source_name}' to '{text}'.")
-
-    #######################################################################
-    def clear(self) -> None:
-        """
-        Reset the on-screen timer text source.
-        """
-        self.set_text("")
-        self.hide()
-
-    #######################################################################
-    def show(self) -> None:
-        self._set_visibility(True)
-
-    #######################################################################
-    def hide(self) -> None:
-        self._set_visibility(False)
-
-
-    # ---------------------------------------------------------------------
-    # Internal OBS helpers
-    # ---------------------------------------------------------------------
-
-    #######################################################################
-    def _set_visibility(self, visibility: bool):
-        """
-        Set the visibility of the sceneitem associated with the
-        configured text source.
-        """
-        try:
-            with OBS.sceneitem_by_name(self.text_source_name) as si:
-                OBS.sceneitem_set_visible(si, visibility)
-        except:
-            OBS.error("Failed to set sceneitem visibility.")
+    username: str
+    display_name: str
+    message: str
+    is_mod: bool
+    is_broadcaster: bool
 
 
 ###########################################################################
@@ -1607,11 +2035,11 @@ class GuessManager:
     manager->clear()                      # Reset back to defaults.
     """
 
-    #######################################################################
+    #----------------------------------------------------------------------
     def __init__(self):
         self.clear()
 
-    #######################################################################
+    #----------------------------------------------------------------------
     def clear(self) -> None:
         self.active: bool = False
 
@@ -1624,15 +2052,15 @@ class GuessManager:
         self.winner: Optional[str] = None
         self.actual_secs: Optional[int] = None
 
-    #######################################################################
+    #----------------------------------------------------------------------
     def running(self) -> bool:
         return self.active
 
-    #######################################################################
+    #----------------------------------------------------------------------
     def start(self) -> None:
         self.active = True
 
-        self.start_time = self._now()
+        self.start_time = DT.now()
         self.stop_time = None
         self.auto_hide_time = None
 
@@ -1641,23 +2069,23 @@ class GuessManager:
         self.winner = None
         self.actual_secs = None
 
-    #######################################################################
-    def has_guess(self, username: str) -> bool:
-        return username in self.guesses.keys()
+    #----------------------------------------------------------------------
+    def has_guess(self, username: str) -> int | False:
+        return self.guesses[username] if username in self.guesses.keys() else False
 
-    #######################################################################
+    #----------------------------------------------------------------------
     def add_guess(self, username: str, seconds: int) -> bool:
         if not self.active:
             return False # Can't guess when brb isn't running.
 
-        if username in self.guesses.keys:
+        if self.has_guess(username):
             return False # User already has a guess registered.
 
         self.guesses[username] = seconds
 
         return True # Guess added.
 
-    #######################################################################
+    #----------------------------------------------------------------------
     def elapsed_time(self) -> datetime.timedelta | None:
         """
         Handles the time logic for the difference between the recorded
@@ -1673,7 +2101,7 @@ class GuessManager:
         """
         if self.active:
             # Finish time is ongoing.
-            finish_time = self._now()
+            finish_time = DT.now()
         elif self.stop_time is not None:
             # Finish time is stored from last !back.
             finish_time = self.stop_time
@@ -1685,7 +2113,7 @@ class GuessManager:
 
         return elapsed
 
-    #######################################################################
+    #----------------------------------------------------------------------
     def timer_str(self) -> str:
         """
         Consistent formatting for the on-screen timer.
@@ -1698,8 +2126,13 @@ class GuessManager:
 
         return DT.duration_str(elapsed)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     def end(self, auto_hide_secs: int) -> None:
+        # Handle a stream ending with no !brb's having been run.
+        if not self.active:
+            return
+
+        # Otherwise shut down cleanly.
         self.active = False
 
         self.stop_time = DT.now()
@@ -1707,17 +2140,24 @@ class GuessManager:
 
         self.auto_hide_time = DT.duration_secs_to_dt(auto_hide_secs)
 
-    #######################################################################
-    def winner(self) -> str:
+    #----------------------------------------------------------------------
+    def winner(self) -> tuple[str, int]:
+        """
+        Returns false if no !brb has run, or is still running, or if nobody registered any guesses.
+
+        Returns a tuple of (username, guessed_secs) when a winner is present.
+        """
         if self.active:
             return False # No winner when brb is still active.
 
         if len(self.guesses) == 0:
             return False # Nobody guessed, so there's no winner.
 
-        return self._qualified.keys()[-1]
+        username = self._qualified.keys()[-1]
+        guessed_secs = self.guesses[username]
+        return (username, guessed_secs)
 
-    #######################################################################
+    #----------------------------------------------------------------------
     def should_hide(self) -> bool:
         """
         Takes the configured auto-hide delay into account after a !back
@@ -1730,11 +2170,11 @@ class GuessManager:
             return False
 
         if self.auto_hide_time is not None:
-            return self._now() >= self.auto_hide_time
+            return DT.now() >= self.auto_hide_time
 
         return True
 
-    #######################################################################
+    #----------------------------------------------------------------------
     def _qualified(self) -> Dict[str, int]:
         # Exclude any guess larger than the actual seconds.
         qualified = dict(filter(
@@ -1751,538 +2191,204 @@ class GuessManager:
 
 
 ###########################################################################
-# Twitch API Wrapper
+# OBS Timers Wrapper
 ###########################################################################
 
-class TwitchApi:
+class Timers:
     """
-    Encapsulate http calls to Twitch's APIs.
+    Wrapper around OBS's timer_add and timer_remove to work around a
+    limitation where the python scripting bridge only supports top-level
+    module functions as timers-- they can't be nested as instance methods.
+
+    So this class wraps them in a lambda that the bridge CAN call, and
+    also stores a reference to them to allow for removal (since the
+    lambdas make the _actual_ timer method anonymous.)
+    """
+    entries = {}
+    obs = None
+
+    #----------------------------------------------------------------------
+    def __init__(self, obs_module):
+        self.obs = obs_module
+
+    #----------------------------------------------------------------------
+    def add(self, timer: ObsTimerCallback, millisecs: int) -> ObsTimerCallback:
+        func_name = str(timer)
+        if func_name in self.entries.keys():
+            raise ValueError(f"Timer already exists: {func_name}")
+        self.entries[func_name] = dispatch(timer)
+        self.obs.timer_add(self.entries[func_name], millisecs)
+        return self.entries[func_name]
+
+    #----------------------------------------------------------------------
+    def remove(self, timer: ObsTimerCallback) -> bool:
+        func_name = str(timer)
+        if func_name not in self.entries.keys():
+            raise ValueError(f"Timer does not exist: {func_name}")
+        self.obs.timer_remove(self.entries[func_name])
+        self.entries.pop(func_name, None)
+        return True
+
+
+###########################################################################
+# Timer Renderer
+###########################################################################
+
+class TimerRenderer:
+    """
+    Handles the display and contents of the  OBS on-screen timer.
     """
 
-    #######################################################################
-    def __init__(self, client_id, token):
-        self.client_id = client_id
-        self.token = token
+    #----------------------------------------------------------------------
+    def __init__(self, text_source_name: str):
+        self.set_source(text_source_name)
 
-    #######################################################################
-    def validate(self) -> Dict[str, any] | False:
+    #----------------------------------------------------------------------
+    def set_source(self, text_source_name: str) -> None:
+        self.text_source_name = text_source_name
+
+    #----------------------------------------------------------------------
+    def set_text(self, text: str) -> bool:
         """
-        Sample response:
-
-        {
-            'client_id': 'ja5swzyzsr1euwm0e53h1sxqhk553l',
-            'login': 'beporter',
-            'scopes': [
-                'chat:edit',
-                'moderator:read:followers',
-                'moderator:read:moderators',
-                'user:bot'
-            ],
-            'user_id': '29519624',
-            'expires_in': 4765582
-        }
-
+        Update the on-screen timer with the provided text.
         """
-        resp = self._get('oauth2/validate')
-
-        if not resp:
-            OBS.error("oauth2/validate failed.")
+        if not self.text_source_name:
+            OBS.error(f"No text_source_name is set. Call .set_source(text_source_name)")
             return False
 
-        if not resp['login']:
-            OBS.error("OAuth token is not attached to a user.")
-            return False
-
-        if not set(TwitchOAuth.OAUTH_SCOPES).issubset(resp['scopes']):
-            missing_scopes = ", ".join(set(TwitchOAuth.OAUTH_SCOPES) - set(resp['scopes']))
-            OBS.error(
-                "OAuth token is lacking necessary scopes: (%s)" % (missing_scopes),
-            )
-            return False
-
-        return {
-            'client_id': resp.get('client_id', ''),
-            'login': resp.get('login', ''),
-            'scopes': resp.get('scopes', []),
-            'broadcaster_id': int(resp.get('user_id', '')),
-            'expires_in': resp.get('expires_in', None), # int seconds
-            'expires_at': DT.duration_secs_to_dt(resp.get('expires_in', None)), # datetime
-        }
-
-    #######################################################################
-    def channel(self, broadcaster_id: int) -> Dict[str, any]:
-        """
-        Ref: https://dev.twitch.tv/docs/api/reference#get-channel-information
-        """
-        resp = self._get('helix/channels', {'broadcaster_id': broadcaster_id})
-
-        if not resp:
-            OBS.error(f"helix/channels failed for broadcaster_id: {broadcaster_id}")
-            return False
-
-        if not resp.get('data') and resp.get('data', []).get(0):
-            OBS.error(f"No channel data returned for broadcaster_id: {broadcaster_id}")
-            return False
-
-        channel = resp.get('data')[0]
-
-        return {
-            'broadcaster_id': int(channel.get('broadcaster_id', -1)),
-            'broadcaster_login': channel.get('broadcaster_login', ''),
-            'broadcaster_name': channel.get('broadcaster_name', ''),
-            'broadcaster_language': channel.get('broadcaster_language', 'en'),
-            'game_id': int(channel.get('game_id', -1)),
-            'game_name': channel.get('game_name', ''),
-            'title': channel.get('title', ''),
-            'tags': channel.get('tags', []),
-            'content_classification_labels': channel.get('content_classification_labels', []),
-            'is_branded_content': bool(channel.get('is_branded_content', False)),
-        }
-
-    # ---------------------------------------------------------------------
-    # Internal Helpers
-    # ---------------------------------------------------------------------
-
-    #######################################################################
-    def _get(self, path, params = {}, extra_headers = {}):
-        server = self._server(path)
-        url = f"{server}/{path}?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url, headers=self._headers(extra_headers))
-
-        try:
-            with urllib.request.urlopen(req) as r:
-                return json.load(r)
-        except urllib.error.HTTPError as e:
-            if e.code == 401:
-                try:
-                    detail = json.load(e["message"])
-                except Exception:
-                    detail = "unauthorized"
-
-            # Ref: https://dev.twitch.tv/docs/api/guide/#twitch-rate-limits
-            if e.code == http.HTTPStatus.TOO_MANY_REQUESTS:
-                total = e.headers.get('Ratelimit-Limit')
-                remaining = e.headers.get('Ratelimit-Remaining')
-                reset = DT.epoch_secs_to_dt(e.headers.get('Ratelimit-Reset'))
-                detail = (
-                    f"Rquest for {e.url()} was rate limited. "
-                    f"({remaining}/{total} requests remaining. "
-                    f"Reset at {reset.strptime()}.)"
+        with OBS.source_by_name(self.text_source_name) as source:
+            if source is None:
+                OBS.error(
+                    f"Couldn't find source named '{self.text_source_name}'."
                 )
+                return False
 
-            OBS.error(detail)
-
-        return False
-
-    #######################################################################
-    def _server(self, path):
-        match path.split('/', 2)[0]:
-            case 'oauth2':
-                return 'https://id.twitch.tv'
-            case _:
-                return 'https://api.twitch.tv'
-
-    #######################################################################
-    def _headers(self, extra = {}):
-        return {
-            'User-Agent': f"{SCRIPT_NAME} v{SCRIPT_VERSION}",
-            'Accept': 'application/json',
-            'Authorization': f"Bearer {self.token}",
-            'Client-ID': self.client_id,
-        } | extra
-
-
-###########################################################################
-# Twitch OAuth Wrapper
-###########################################################################
-
-class TwitchOAuth:
-    """
-    Coordinates the entire OAuth implicit grant process against Twitch.
-
-    Generates the starting URL to be opened in the user's browser.
-
-    That URL sets up the necessary OAuth query args and the user
-    submits to id.twitch.tv.
-
-    Twitch redirects back to the GH Pages hosted landing page, where
-    some JS prints out the access token.
-
-    The user copies and pastes the access token into the OBS
-    properties for this script.
-
-    The script fires Twitch API calls to validate the token, get
-    expiration information, and fetch broadcaster and channel info
-    necessary for IRC bot use.
-    """
-
-    # BRB Timer for Chat
-    # by beporter@users.sourceforge.net
-    # https://dev.twitch.tv/console/apps/ja5swzyzsr1euwm0e53h1sxqhk553l
-    APP_CLIENT_ID = "ja5swzyzsr1euwm0e53h1sxqhk553l"
-    OAUTH_SCOPES = [
-        # Receive and send irc chat messages.
-        # https://dev.twitch.tv/docs/api/reference/#send-chat-message
-        "chat:edit",
-    ]
-    #KICKOFF_URL = "http://localhost:8765/start.html"
-    KICKOFF_URL = "https://beporter.github.io/brb-timer/start.html"
-    # AUTHORIZE_URL = "https://id.twitch.tv/oauth2/authorize"
-    # TOKEN_URL = "https://id.twitch.tv/oauth2/token";
-    #DESTINATION_URL = "https://beporter.github.io/brb-timer/destination.html"
-
-    #######################################################################
-    def __init__(self, settings: BRBSettings):
-        self.settings = settings
-
-    #######################################################################
-    @classmethod
-    def kickoff_url(self) -> str:
-        """
-        Points to this project's Github Pages "start" page.
-
-        That page handles all of the OAuth scope itself directly, so
-        no params are strictly required here.
-        """
-        return self.KICKOFF_URL # TODO: Toggle on debug
-
-    #######################################################################
-    # def oauth_url(self) -> str:
-    #     """
-    #     Construct a URL to open in the OBS user's browser to start the Twitch OAuth implicit grant flow.
-
-    #     This script's GitHub repository hosts the kickoff and destination pages.
-    #     """
-    #     return (
-    #         self.AUTHORIZE_URL
-    #         + "?"
-    #         + urllib.parse.urlencode(self.params())
-    #     )
-
-    #######################################################################
-    # def params(self) -> str:
-    #     return {
-    #         "response_type": "token",
-    #         "client_id": self.APP_CLIENT_ID,
-    #         "redirect_uri": self.server.redirect_uri(),
-    #         "scope": " ".join(self.OAUTH_SCOPES),
-    #         "state": self.oauth_state,
-    #     }
-
-    #######################################################################
-    def creds_present(self) -> bool:
-        if (
-            self.settings.twitch_oauth_access_token is None
-            or len(self.settings.twitch_oauth_access_token) == 0
-            or self.settings.twitch_oauth_expiry_at is None
-            or self.settings.twitch_oauth_expiry_at == 0
-        ):
-            OBS.info('No Twitch OAuth token saved.')
-            return False
-
-        if self.creds_expired():
-            return False
+            OBS.source_update(source, {'text': text})
+            OBS.debug(
+                "Set timer text source "
+                f"'{self.text_source_name}' to '{text}'."
+            )
 
         return True
 
-    #######################################################################
-    def creds_expired(self) -> bool:
-        if isinstance(self.settings.twitch_oauth_expiry_at, datetime.datetime):
-            expiry = self.settings.twitch_oauth_expiry_at
-            self.settings.twitch_oauth_expiry_at = int(expiry.timestamp())
-        elif isinstance(self.settings.twitch_oauth_expiry_at, str):
-            expiry = DT.iso_str_to_dt(self.settings.twitch_oauth_expiry_at)
-            self.settings.twitch_oauth_expiry_at = int(expiry.timestamp())
-        else:
-            expiry = DT.epoch_secs_to_dt(int(self.settings.twitch_oauth_expiry_at))
-
-        if (
-            self.settings.twitch_oauth_access_token is not None
-            and self.settings.twitch_oauth_expiry_at is not None
-            and self.settings.twitch_oauth_expiry_at != 0
-            and expiry < DT.now()
-        ):
-            OBS.info('Stored Twitch OAuth token has expired.')
-            return True
-
-        return False
-
-    #######################################################################
-    def creds_set(self, access_token: str, expires_at: int = 0) -> bool:
-        self.clear_settings() # Have to invalidate existing api instance when token changes.
-
-        # Cast expires at from string,
-        if isinstance(self.settings.twitch_oauth_expiry_at, str):
-            expires_at = DT.iso_str_to_dt(self.settings.twitch_oauth_expiry_at)
-
-        # or datetime oject, to int.
-        if isinstance(expires_at, datetime.datetime):
-            expires_at = int(expires_at.timestamp())
-
-        self.settings.twitch_oauth_access_token = access_token
-        self.settings.twitch_oauth_expiry_at = expires_at
-
-        if not self.user_get():
-            OBS.error("New twitch access token is not valid. Removing existing settings.")
-            self.clear_settings()
-
-            return False
-
-        OBS.info("New twitch access token is valid. Repopulating user and channel info.")
-        self.channel_get()
-
-        return True
-
-    #######################################################################
-    def user_present(self) -> bool:
-        return (
-            self.settings.twitch_broadcaster_id > 0
-            and len(self.settings.twitch_username) > 0
-        )
-
-    #######################################################################
-    def user_get(self) -> Dict[str, any] | False:
-        if not self.user_present():
-            if self.creds_present():
-                validated = self._api().validate()
-                if not validated:
-                    OBS.info('Twitch OAuth token validation failed.')
-
-                    return False
-
-                OBS.info('Twitch OAuth token validation succeeded.')
-                self.settings.twitch_oauth_expiry_at = int(validated['expires_at'].timestamp())
-                self.user_set(validated['broadcaster_id'], validated['login'])
-
-        return {
-            'id': self.settings.twitch_broadcaster_id,
-            'name': self.settings.twitch_username,
-        }
-
-    #######################################################################
-    def user_set(self, broadcaster_id: int, username: str) -> bool:
-        self.settings.twitch_broadcaster_id = broadcaster_id
-        self.settings.twitch_username = username
-
-        return True
-
-    #######################################################################
-    def channel_present(self) -> bool:
-        return (
-            self.settings.twitch_broadcaster_id > 0
-            and len(self.settings.twitch_channel) > 0
-        )
-
-    #######################################################################
-    def channel_get(self) -> str:
+    #----------------------------------------------------------------------
+    def clear(self) -> None:
         """
-        Fetches and stores the OBS user's Twitch channel name on demand.
-
-        This is initially called really early for the script's OBS GUI
-        properties, so we do a bit more guarding/setup.
+        Reset the on-screen timer text source.
         """
-        if not self.channel_present():
-            if self.creds_present() and self.user_present():
-                channel = self._api().channel(self.settings.twitch_broadcaster_id)
-                if not channel:
-                    OBS.info('Twitch channel info fetch failed.')
+        self.set_text('')
+        self.hide()
 
-                    return ''
+    #----------------------------------------------------------------------
+    def show(self) -> None:
+        self._set_visibility(True)
 
-                OBS.info('Twitch OAuth channel info fetch succeeded.')
-                self.channel_set(channel['broadcaster_name'])
+    #----------------------------------------------------------------------
+    def hide(self) -> None:
+        self._set_visibility(False)
 
-        return self.settings.twitch_channel
+    # ---------------------------------------------------------------------
+    # Internal OBS Helpers
+    # ---------------------------------------------------------------------
 
-    #######################################################################
-    def channel_set(self, channel: str) -> bool:
-        self.settings.twitch_channel = channel
-
-        return True
-
-    #######################################################################
-    def clear_settings(self):
-        self.settings.twitch_oauth_access_token = ''
-        self.settings.twitch_oauth_expiry_at = 0
-
-        self.settings.twitch_broadcaster_id = -1
-        self.settings.twitch_username = ''
-        self.settings.twitch_channel = ''
-
-        self.api = None
-
-    #######################################################################
-    def _api(self) -> TwitchApi|False:
-        if not self.creds_present():
-            OBS.debug('Attempted TwitchApi access without creds set first.')
-            return False
-
-        if not self.api:
-            self.api = TwitchApi(
-                self.APP_CLIENT_ID,
-                self.settings.twitch_oauth_access_token
-            )
-
-        return self.api
+    #----------------------------------------------------------------------
+    def _set_visibility(self, visibility: bool) -> None:
+        """
+        Set the visibility of the sceneitem associated with the
+        configured text source.
+        """
+        try:
+            with OBS.scene_current() as scene:
+                with OBS.sceneitem_by_name(self.text_source_name, scene) as si:
+                    OBS.sceneitem_set_visible(si, visibility)
+        except:
+            OBS.error("Failed to set sceneitem visibility.")
 
 
 ###########################################################################
-# OBS Property Factory
+# Script Settings Storage
 ###########################################################################
 
-class OBSPropsFactory:
+@dataclass
+class BRBSettings(TypedDict):
     """
-    This class serves a few important purposes:
+    Holds the script's internal settings/config data.
 
-    1. It encapsulates the variety, order and release of the raw
-       `obs.property_*()` functions to ensure a consistent API for this
-       script to use.
-    2. Because the obspython bridges into C++ code, it's
-       unpythonic/unintuitve and hard to find what you need in the docs.
-       This class acts as a documentation bridge by demonstrating proper
-       usage of the raw `obs` module functions.
-    3. It (theoretically) consolidates calls to the `obs` module, making
-       the rest of the script easier to test in isolation.
+    Also acts as a runtime wrapper for the data that we need to have
+    persisted by OBS between launches.
 
-    This class is "sparse". It only defines methods for the types of
-    properties this script needs to function.
+    This class does NOT need to store anything from `script_properties()`
+    since OBS already handles that. This class is for values not intended
+    to be exposed to the user.
+
+    Typing is critical here to ensure our to_data() method calls the
+    right obs module method.
     """
+    twitch_oauth_access_token: str = None
+    twitch_oauth_expiry_at: int = 0
 
-    #######################################################################
-    def __init__(self, props_container):
-        self.props = props_container
+    twitch_broadcaster_id: int = None
+    twitch_username: str = None
+    twitch_channel: str = None
 
-    #######################################################################
-    def text(self, type: int, name: str, desc: str = "") -> None:
-        obs.obs_properties_add_text(
-            self.props,
-            name,
-            desc if desc is not None else desc.replace("_", " ").capitalize(),
-            type,
-        )
+    auto_hide_secs: int = DEFAULTS.AUTO_HIDE_SECS
 
-    #######################################################################
-    def twitch_button(
-        self,
-        keyword: str,
-        url: str = None,
-        text_type: int = obs.OBS_TEXT_INFO_NORMAL,
-        long_desc: str = '',
-    ) -> None:
-        if url is not None:
-            return self.url_button(
-                f"{keyword}_twitch",
-                f"{keyword.capitalize()} Twitch",
-                # URL and callback are mutually exclusive for our needs.
-                None, #getattr(script, f"twitch_creds_{keyword}"),
-                url,
-                text_type,
-                long_desc,
-            )
-        else:
-            return self.button(
-                f"{keyword}_twitch",
-                f"{keyword.capitalize()} Twitch",
-                getattr(script, f"twitch_creds_{keyword}"),
-                text_type,
-                long_desc,
-            )
-
-    #######################################################################
-    def url_button(
-        self,
-        base_name: str,
-        desc: str,
-        callback: Callable,
-        url: str,
-        text_type: int = obs.OBS_TEXT_INFO_NORMAL,
-        long_desc: str = '',
-        wrap: bool = True,
-    ):
-        b = self.button(base_name, desc, callback, text_type, long_desc, wrap)
-        obs.obs_property_button_set_type(b, obs.OBS_BUTTON_URL)
-        obs.obs_property_button_set_url(b, url)
-
-        return b # In case any further modification is desired.
-
-    #######################################################################
-    def button(
-        self,
-        base_name: str,
-        desc: str,
-        callback: Callable,
-        text_type: int = obs.OBS_TEXT_INFO_NORMAL,
-        long_desc: str = '',
-        wrap: bool = True,
-    ):
+    #----------------------------------------------------------------------
+    def __setattr__(self, name: str, value: any) -> any:
         """
-        Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5/src/example_class.py#L41
+        Prevent the addition of arbitrary new attributes.
+
+        This means trying to set `settings.some_new_attr = 'value'` will
+        raise an AttributeError.
         """
-        b = obs.obs_properties_add_button(
-            self.props,
-            f"{base_name}_button",
-            desc,
-            lambda props, prop: callback(props, prop),
-        )
-        # Ref: https://docs.obsproject.com/reference-properties#c.obs_property_set_long_description
-        if len(long_desc) > 0:
-            i = obs.obs_properties_add_text(
-                self.props,
-                f"{base_name}_info",
-                long_desc,
-                obs.OBS_TEXT_INFO,
+        if not hasattr(self, name):
+            raise AttributeError(f"Invalid setting '{name}'.")
+
+        object.__setattr__(self, name, value)
+        return value
+
+    #----------------------------------------------------------------------
+    def from_data(self, data): # data: obs_data_t
+        incoming = OBS.data_get_all(data)
+        attrs = self.__attrs()
+        for name, value in incoming.items():
+            if name in attrs:
+                #OBS.debug(f"Importing {name} = {value}")
+                setattr(self, name, value)
+
+    #----------------------------------------------------------------------
+    def to_data(
+            self,
+            existing = None, # obs_data_t
+        ): # -> obs_data_t
+        """
+        Dump all local BRBSettings attributes to the provided obs_data_t
+        object.
+        """
+        for name in self.__attrs():
+            value = getattr(self, name)
+            #OBS.debug(f"Setting {name} = {value}")
+            OBS.data_set(
+                existing if existing is not None else self.__obs_data,
+                name,
+                value,
             )
-            obs.obs_property_text_set_info_type(i, text_type)
-            obs.obs_property_text_set_info_word_wrap(i, wrap)
 
-        return b # In case any further modification is desired.
+    #----------------------------------------------------------------------
+    def to_json(self) -> str:
+        out = {}
+        for name in self.__attrs():
+            value = getattr(self, name)
+            out[name] = value
 
-    #######################################################################
-    # def text_source_list(self, name: str, desc: str, long_desc: str = '') -> None:
-    #     # Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5/src/duplicate_source.py#L51-L63
-    #     sources = obs.obs_enum_sources()
-    #     if sources is not None:
-    #         p = obs.obs_properties_add_list(
-    #             self.props,
-    #             name,
-    #             desc,
-    #             obs.OBS_COMBO_TYPE_LIST,
-    #             obs.OBS_COMBO_FORMAT_STRING,
-    #         )
-    #         obs.obs_property_list_add_string(p, "", "")
-    #         obs.obs_property_list_add_string(p, "(Add New)", "__add_new__")
-    #         for source in sources:
-    #             source_type_id = obs.obs_source_get_unversioned_id(source)
-    #             source_name = obs.obs_source_get_name(source)
-    #             source_uuid = obs.obs_source_get_uuid(source)
-    #             # There doesn't seem to be another way to identify these.
-    #             icon_type = obs.obs_source_get_icon_type(source_type_id)
-    #             if icon_type == obs.OBS_ICON_TYPE_TEXT:
-    #                 obs.obs_property_list_add_string(p, source_name, source_uuid)
+        return json.dumps(out)
 
-    #         i = obs.obs_properties_add_text(
-    #             self.props,
-    #             f"{name}_info",
-    #             long_desc,
-    #             obs.OBS_TEXT_INFO,
-    #         )
-    #         obs.obs_property_text_set_info_type(i, obs.OBS_TEXT_INFO_NORMAL)
-    #         obs.obs_property_text_set_info_word_wrap(i, True)
-
-    #         obs.source_list_release(sources)
-
-    #######################################################################
-    def int_with_unit(
-        self,
-        name: str,
-        desc: str,
-        min: int,
-        max: int,
-        step: int,
-        unit: str,
-    ) -> None:
-        a = obs.obs_properties_add_int(self.props, name, desc, min, max, step)
-        obs.obs_property_int_set_suffix(a, unit)
+    #----------------------------------------------------------------------
+    def __attrs(self) -> list[str]:
+        return [
+            attr for attr in vars(self)
+            if not callable(getattr(self, attr)) and not attr.startswith("_")
+        ]
 
 
 ###########################################################################
@@ -2291,7 +2397,7 @@ class OBSPropsFactory:
 
 class BRBScript:
     """
-    This class serves as the scripts main controller.
+    This class serves as the script's main controller.
 
     It provides methods for the OBS hook functions to call, in order to
     keep all business logic consolidated here.
@@ -2304,75 +2410,13 @@ class BRBScript:
     Architecture:
 
         BRBScript ---------------------------------------------|
-            |          v        |        v       |             |
-            |      TwitchApi    |   BRBSettings  |             |
-            v                   v                v             v
-        TwitchOauth       TwitchIRCClient   GuessManager  TimerRenderer
-            |                   |                              |
-            v                   v                              v
-        TwitchOAuthServer  ChatMessage                   SourceGenerator
-            |
-            v
-        TwitchOAuthHandler
-
-    Example lifecycle:
-
-    * OBS Launches ->
-        * script_defaults() called
-            * ✅ provide default property values.
-        * script_description() called
-            * ✅ provide static string.
-        * script_load() called (obs frontend isn't active yet! Can't enumerate sources, for example.)
-            * initialize BRBScript state & BRBSettings
-                * ✅ check for and load existing twitch oauth creds
-                * ✅ Register event handlers. `obs.signal_handler_connect()`?
-        * script_update() called once
-            * ✅ saves any new settings.
-
-    * User opens the script's Properties pane in the GUI ->
-        * script_properties() called
-            * ✅ construct script properties for display in GUI.
-        * whenever a property value is changed ->
-            * ✅ script_update() called.
-
-    * OBS_FRONTEND_EVENT_FINISHED_LOADING event fires ->
-        * handler:
-            * ✅ creates text source if it doesn't exist.
-            * registers event handlers to:
-                * ✅ create IRC background thread when streamer goes live
-                * ✅ kill irc when streaming stops
-
-    * "Connect Twitch" button clicked ->
-        * BRBScript:
-            * ✅ launches a local webserver thread
-            * ✅ opens browser window.
-    * Web server thread handles POST successfully ->
-        * ✅ calls script.on_oauth_creds(data) -> writes oauth creds to script's OBS internal settings
-        * ✅ web server thread shuts down.
-        * ✅ call TwitchApi to fill in broadcaster details
-
-    * script_tick() called for every rendered frame ->
-        * (We do nothing.)
-
-    * Streamer starts broadcasting ->
-        * ✅ resets GuessManager
-        * ✅ handler starts irc thread
-        * Mod enters !brb in chat -> irc client notifies BRBScript -> BRBScript:
-            * ✅ updates GuessManager state
-            * ✅ tells IRC to print chat message.
-        * Chatters enter !at commands -> irc client notifies BRBScript -> BRBScript:
-            * ✅ updates GuessManager state
-            * ✅ prints chat message.
-        * Mod enters !back command -> irc client notifies BRBScript -> BRBScript:
-            * ✅ updates GuessManager state
-            * ✅ prints chat message.
-    * Streamer stops broadcasting ->
-        * ✅ handler stops irc thread
-        * ✅ resets GuessManager state
-
-    * OBS shuts down ->
-        * ✅ script_save() -> save any settings
-        * ✅ script_unload() -> clean up any remaining threads.
+            |          v        |        v         |           |
+            |     BRBSettings   | SourceGenerator  |           |
+            v                   v                  v           v
+        TwitchOauth       TwitchIRCClient     GuessManager  TimerRenderer
+            |                   |
+            v                   v
+         TwitchApi         ChatMessage
 
     Ref: https://obsproject.com/kb/scripting-guide#script-lifecycle
     """
@@ -2380,7 +2424,8 @@ class BRBScript:
     settings: BRBSettings = BRBSettings()
     twitch: TwitchOAuth = TwitchOAuth(settings)
     guesses: GuessManager = GuessManager()
-    renderer: TimerRenderer = None
+    renderer: Optional[TimerRenderer] = None
+    timers: Timers = Timers(obs)
 
     # This is initialized on an as-needed basis.
     irc: Optional[TwitchIRCClient] = None
@@ -2388,27 +2433,40 @@ class BRBScript:
     # Flipped on when on_obs_ready() completes successfully.
     frontend_ready: bool = False
 
+    # Store registered event handlers.
+    # Ensures a previously-unaccessed dict key starts out as an empty list.
+    events = defaultdict(list)
+
     # ---------------------------------------------------------------------
     # Data Management
     # ---------------------------------------------------------------------
 
-    #######################################################################
-    def reset(self, settings = None):
+    #----------------------------------------------------------------------
+    def __init__(self, obs_module):
+        self.obs = obs_module
+
+    #----------------------------------------------------------------------
+    def reset(
+            self,
+            settings = None, # obs_data_t
+        ) -> None:
         self.settings = BRBSettings()
         if settings:
             self.settings.from_data(settings)
 
         self.twitch = TwitchOAuth(self.settings)
         self.guesses = GuessManager()
+        self.renderer = None # Gets created when streaming starts.
 
-        # Can't initialize this till the frontend is ready.
-        if self.frontend_ready:
-            self.renderer = TimerRenderer(SOURCES.TEXT_TIMER)
+        self.events = defaultdict(list)
 
-    #######################################################################
-    def settings_merge(self, new_settings):
+    #----------------------------------------------------------------------
+    def settings_merge(
+        self,
+        new_settings, # obs_data_t
+    ) -> None:
         """
-        Sync both directions.
+        Sync settings both directions.
 
         new_settings from OBS get loaded into BRBSettings.
 
@@ -2418,60 +2476,236 @@ class BRBScript:
         self.settings.from_data(new_settings)
         self.settings.to_data(new_settings) # new_settings is modified by this call.
 
-    #######################################################################
-    def update_twitch(self, changes: Dict[str, any] = None):
+    #----------------------------------------------------------------------
+    def update_twitch(self, changes: Dict[str, any] = None) -> bool:
         """
         Make Twitch API queries when we get a new access token.
+
+        token unchanged: no op
+        token not empty -> token empty: remove local settings
+        token was empty -> token non empty: make api calls with new token
+        token not empty -> different token: make api calls with new token
         """
         if (
-            changes is not None
-            and self.changed(changes, 'twitch_oauth_access_token')
-            and len(changes['twitch_oauth_access_token']) > 0
+            changes is None
+            or 'twitch_oauth_access_token' not in changes.keys()
+            or changes['twitch_oauth_access_token'].strip() == self.settings.twitch_oauth_access_token
         ):
-            OBS.info('Updating Twitch OAuth credentials.')
-            self.twitch.creds_set(
-                changes['twitch_oauth_access_token'],
-                # Buy just enough time to run validate().
-                DT.timestamp() + 120,
-            )
+            OBS.debug(f"No effective change to twitch_oauth_access_token.")
+            return len(self.settings.twitch_oauth_access_token) > 0
+
+        new_token = changes['twitch_oauth_access_token'].strip()
+        if (
+            len(new_token) == 0
+            and len(self.settings.twitch_oauth_access_token) > 0
+        ):
+            self.twitch.clear_settings()
+            OBS.warn('Stored Twitch credentials cleared.')
+            return False
+
+        if (len(new_token) > 0):
+            # Buy just enough time to run validate().
+            self.twitch.creds_set(new_token, DT.timestamp() + 120)
 
         # Check for Twitch OAuth creds.
         if not self.twitch.creds_present():
-            OBS.info('No Twitch credentials available yet.')
-        else:
-            # Validate existing token and check for a fetched Twitch user.
-            if not self.twitch.user_get():
-                OBS.info('Twitch OAuth token validation failed.')
+            OBS.warn('No Twitch credentials available yet.')
+            return False
 
-            # Check for a fetched Twitch channel.
-            if not self.twitch.channel_get():
-                OBS.info('Twitch channel info fetch failed.')
+        # Validate token and check for a fetched Twitch user.
+        if not self.twitch.user_get():
+            OBS.error('Twitch OAuth token validation failed.')
+            return False
 
-            OBS.info('Twitch credentials validated.')
+        # Check for a fetched Twitch channel.
+        if not self.twitch.channel_get():
+            OBS.error('Twitch channel info fetch failed.')
+            return False
 
+        OBS.info('Twitch credentials validated.')
+        return True
 
-    #######################################################################
-    def update_renderer(self):
+    #----------------------------------------------------------------------
+    def update_renderer(self, source_name: str) -> bool:
         """
         Tell the renderer to target a different text source if the user
         changed it.
         """
+        if not self.frontend_ready:
+            return False
+
         if (
-            self.frontend_ready
-            and self.renderer is not None
-            and OBS.source_exists(SOURCES.TEXT_TIMER)
+            self.renderer is not None
+            and OBS.source_exists(source_name)
         ):
             self.renderer.clear()
+            self.renderer.set_source(source_name)
 
-        self.renderer = TimerRenderer(SOURCES.TEXT_TIMER)
+        self.renderer = TimerRenderer(source_name)
+
+        return True
+
+    # ---------------------------------------------------------------------
+    # Event Management
+    # ---------------------------------------------------------------------
+
+    #----------------------------------------------------------------------
+    def event_router(
+        self,
+        obs_const: int, # OBS_FRONTEND_EVENT_*
+    ) -> None:
+        """
+        After OBS.event_register_router() has been called, this method
+        is invoked by OBS whenever an event is fired.
+
+        This router is only responsible for determining whether to
+        respond to an event (and triggering any callbacks, if so), or
+        to ignore it.
+        """
+        if (
+            obs_const in self.events.keys()
+            and len(self.events[obs_const]) > 0
+        ):
+            OBS.debug(
+                f"Responding to '{OBS.event_name(obs_const)}' event with "
+                f"{len(self.events[obs_const])} handler(s)."
+            )
+
+            # Run all callbacks.
+            [x() for x in self.events[obs_const]]
+
+    #----------------------------------------------------------------------
+    def event_add(
+        self,
+        obs_const: int, # OBS_FRONTEND_EVENT_*
+        callback: ObsEventCallback,
+    ) -> bool:
+        """
+        Register a callback for a specific OBS event.
+
+        The calling context MUST have already called
+        OBS.event_register_router()
+        """
+        self.events[obs_const].append(lambda: callback())
+        OBS.debug(
+            f"Event listener registered for event {OBS.event_name(obs_const)}: {callback.__name__}"
+        )
+
+    #----------------------------------------------------------------------
+    def event_start_ticking(self) -> None:
+        """
+        Handles a sucessful !brb chat command by registering an OBS
+        "timer" that fires once every second to update the on-screen
+        text source's display count-up time.
+
+        OBS docs specifically warns againt using a python instance method
+        as a timer, so we use a global variable to store the callback.
+
+        Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5/README.md?plain=1#L472
+        """
+        global ticker
+        self.event_stop_ticking()
+
+        ticker_lock = False
+
+        if ticker_lock: # TODO: Need to ensure we don't start duplicate timers.
+            ticker = script.on_timer
+            OBS.timer_add(ticker, 1 * 1000) # ms
+
+    #----------------------------------------------------------------------
+    def event_stop_ticking(self) -> None:
+        global ticker
+        if ticker is not None:
+            OBS.timer_remove(ticker)
+
+        ticker = None
 
 
     # ---------------------------------------------------------------------
     # Event Handlers
     # ---------------------------------------------------------------------
 
-    #######################################################################
-    def on_load(self, settings):
+    #----------------------------------------------------------------------
+    # ✅
+    def on_props(self): # -> obs_properties_t
+        """
+        Handles defining the GUI properties for the script.
+
+        Must be stateless and without conditionals. The modified
+        callbacks will be responsible for showing/hiding any counterpart
+        widgets.
+        """
+        factory = OBSPropsFactory(OBS.properties_create())
+
+        # Currently disabled in favor of auto-create when streaming starts.
+        # factory.button(
+        #     "create_source",
+        #     "Create Text Source",
+        #     self.on_create_source,
+        # )
+
+        factory.twitch_button(
+            'connect', # -> no callback because URL is present. (but would be `BRBScript.on_twitch_connect`)
+            TwitchOAuth.kickoff_url(),
+            self.obs.OBS_TEXT_INFO_NORMAL,
+            (
+                'Open a browser window to obtain '
+                'a Twitch API token for this script to use. '
+                'Paste it below.'
+            )
+        )
+
+        factory.twitch_button(
+            'reconnect', # -> no callback because URL is present. (but would be `BRBScript.on_twitch_reconnect`)
+            TwitchOAuth.kickoff_url(),
+            self.obs.OBS_TEXT_INFO_WARNING,
+            'Twitch token has expired. Please obtain a fresh token.'
+        )
+
+        factory.twitch_button(
+            'disconnect', # -> BRBScript.on_twitch_disconnect
+            None,
+            self.obs.OBS_TEXT_INFO_ERROR,
+            'Remove stored Twitch credentials.'
+        )
+
+        factory.text(
+            "twitch_oauth_access_token",
+            "Twitch OAuth Access Token",
+            self.obs.OBS_TEXT_PASSWORD,
+            self.on_twitch_oauth_access_token
+        )
+
+        # TODO: If irc client is running, show a button to restart it?
+        # factory.button(
+        #     'irc_start',
+        #     'Start IRC Client',
+        #     script.on_irc_start
+        # )
+        # factory.button(
+        #     'irc_stop',
+        #     'Stop IRC Client',
+        #     script.on_irc_stop
+        # )
+
+        factory.int_with_unit(
+            "auto_hide_secs",
+            "Auto-hide Delay (seconds)",
+            0,       # min
+            60 * 30, # max (30 mins)
+            1,       # step
+            " secs", # unit
+            script.on_auto_hide_secs
+        )
+        OBS.debug(f"script_props returning: {factory.props}")
+        return factory.props
+
+    #----------------------------------------------------------------------
+    # ✅
+    def on_load(
+        self,
+        settings, # obs_data_t
+    ) -> None:
         """
         Called from script_load() during first OBS initialization.
 
@@ -2481,25 +2715,26 @@ class BRBScript:
         self.frontend_ready = False
         self.reset(settings)
 
-        # Ensures a previously-unaccess dict key starts out as an empty list.
-        self.events = defaultdict(list)
         OBS.event_register_router(self.event_router)
 
         self.event_add(
-            obs.OBS_FRONTEND_EVENT_FINISHED_LOADING,
+            self.obs.OBS_FRONTEND_EVENT_FINISHED_LOADING,
             self.on_obs_ready,
         )
         self.event_add(
-            obs.OBS_FRONTEND_EVENT_STREAMING_STARTING,
+            self.obs.OBS_FRONTEND_EVENT_STREAMING_STARTING,
             self.on_streaming_starting,
         )
         self.event_add(
-            obs.OBS_FRONTEND_EVENT_STREAMING_STOPPING,
+            self.obs.OBS_FRONTEND_EVENT_STREAMING_STOPPING,
             self.on_streaming_stopping,
         )
 
-    #######################################################################
-    def on_obs_ready(self):
+        OBS.debug(f"on_load settings: {OBS.data_get_json(settings)}")
+
+    #----------------------------------------------------------------------
+    # ✅
+    def on_obs_ready(self) -> None:
         """
         Handles the OBS "frontend finished loading" event.
 
@@ -2509,17 +2744,66 @@ class BRBScript:
         Does not fire if the script is re-loaded in the GUI. Only runs
         on OBS startup.
         """
-        # TODO: investigate obs_frontend_get_app_config() to pull the script's settings out of band here.
-        #self.update_twitch()
-
-        #self.update_renderer()
-
         self.frontend_ready = True
+
+        # Create the text source if it doesn't already exist.
+        if not OBS.source_exists(SOURCES.TEXT_TIMER):
+            OBS.debug(f"Creating on-screen timer text source named: {SOURCES.TEXT_TIMER}")
+            self.on_create_source()
+
         OBS.info(f"{SCRIPT_NAME} ready!")
 
-    #######################################################################
-    def on_create_source(self, props, prop):
-        source = SOURCES.TEXT_TIMER
+    #----------------------------------------------------------------------
+    # ✅
+    def on_update(
+        self,
+        changed_settings, # obs_data_t
+    ) -> None:
+        """
+        Fired whenever the script's GUI properties are edited, or
+        something changes in OBS (such as activating a scene or making
+        a source visibile.)
+
+        Responsible for propagating OBS's settings into this script's
+        runtime state.
+
+        Avoid side-effects here-- leave that to the individual
+        `obs_property_set_modified_callback()` handlers.
+
+        Can't affect GUI widgets, only stored data.
+        """
+        # incoming = OBS.data_get_all(changed_settings)
+
+        # script.update_twitch(incoming)
+
+        # Write our tweaked settings values back to the provided
+        # `settings` data_t object for OBS to persist for us.
+        script.settings.to_data(changed_settings)
+
+
+        # # Update GUI properties.
+        # #script.on_props()
+        # OBS.debug(f"props = {props}, prop = {obs.obs_property_name(prop)}, settings = {OBS.data_get_json(settings)}")
+        # auto_hide_val = OBS.data_get_all(settings)['auto_hide_secs']
+        # #auto_hide_prop = obs.obs_properties_get(props, 'auto_hide_secs')
+
+        # obs.obs_property_set_description(prop, f"auto hide {auto_hide_val}")
+
+
+        # OBS.debug(f"props = {props}, prop = {prop}, settings = {OBS.data_get_json(settings)}")
+
+        # OBS.debug("Forcing GUI property refresh.")
+        # return True
+
+    #----------------------------------------------------------------------
+    # ✅
+    def on_create_source(
+        self,
+        props = None, # obs_properties_t
+        prop = None, # obs_property_t
+    ) -> bool:
+        if prop is None:
+            source = SOURCES.TEXT_TIMER
 
         if not self.frontend_ready:
             OBS.warn("OBS frontend is not yet ready. Can't create text source.")
@@ -2540,27 +2824,30 @@ class BRBScript:
             )
             return True
 
-        OBS.debug(
+        OBS.error(
             f"Failed to create new Timer Text Source '{source}'.",
         )
         return False
 
-    #######################################################################
-    def on_streaming_starting(self):
+    #----------------------------------------------------------------------
+    #
+    def on_streaming_starting(self) -> None:
         """
         Script "main loop". Start up the IRC client to listen for chat
         commands.
         """
-        # Check creds. Abort without twitch user/channel info.
+        # Assume the frontend is ready if we're starting to stream.
+        self.frontend_ready = True
+
+        # Check creds. Bail out without twitch user/channel info.
         if not self.update_twitch():
-            OBS.warn("No Twitch credentials saved. Skipping IRC bot startup.")
+            OBS.warn("No Twitch credentials saved. Skipping Timer Source check and IRC bot startup.")
             return
 
         # Prep on-screen timer.
-        if self.renderer is None:
-            self.renderer = TimerRenderer(SOURCES.TEXT_TIMER)
-        self.renderer.set_text(DEFAULTS.TIMER_TEXT)
-        self.renderer.hide()
+        if self.update_renderer(SOURCES.TEXT_TIMER):
+            OBS.debug('On-screen timer hidden.')
+            self.renderer.hide()
 
         # Start the IRC client.
         self.irc = TwitchIRCClient(
@@ -2572,35 +2859,47 @@ class BRBScript:
         self.irc.start()
         OBS.info(f"{SCRIPT_NAME} IRC chat bot started.")
 
-    #######################################################################
-    def on_timer(self):
+        # TODO: show/hide prop buttons? Can't do that here cause they're not args.
+
+    #----------------------------------------------------------------------
+    #
+    def on_timer(self) -> None:
         """
         Scheduled to run every second while a brb is active.
 
         Updates the on-screen timer.
         """
+        OBS.debug('Timer triggered.')
         if self.guesses.should_hide():
+            OBS.debug("should_hide is true- removing self")
             self.renderer.hide()
-            OBS.timer_remove_self()
+            OBS.event_remove_self()
 
-        self.renderer.set_text(self.guesses.timer_str())
+        timer_text = self.guesses.timer_str()
+        OBS.debug(f"Setting on-screen text to {timer_text}")
+        self.renderer.set_text(timer_text)
 
-    #######################################################################
-    def on_streaming_stopping(self):
+    #----------------------------------------------------------------------
+    #
+    def on_streaming_stopping(self) -> None:
         """
         Shutdown the background IRC client thread and reset script state.
         """
+        # Stop guesses immediately.
+        self.guesses.end(5)
+
         # Hide the on-screen timer.
         self.event_stop_ticking()
-        self.renderer.hide()
-        self.guesses.end()
+        # if self.renderer is not None:
+        #     self.renderer.hide()
 
         # Shut down the IRC client.
         if self.irc is not None and self.irc.running:
             self.irc.stop()
 
-    #######################################################################
-    def on_unload(self):
+    #----------------------------------------------------------------------
+    #
+    def on_unload(self) -> None:
         self.frontend_ready = False
 
         OBS.event_unregister_router(self.event_router)
@@ -2616,82 +2915,118 @@ class BRBScript:
 
 
     # ---------------------------------------------------------------------
-    # Event Management
+    # OBS Widget Modified Callbacks
     # ---------------------------------------------------------------------
 
-    #######################################################################
-    def event_router(self, obs_const: int):
+    #----------------------------------------------------------------------
+    def on_twitch_connect(
+        self,
+        props, # obs_properties_t
+        prop, # obs_property_t
+    ) -> bool:
         """
-        After OBS.event_register_router() has been called, this method
-        is invoked by OBS whenever an event is fired.
-
-        This router is only responsible for determining whether to
-        respond to an event (and triggering any callbacks, if so), or
-        to ignore it.
+        GUI button click handler.
         """
-        if (
-            obs_const in self.events.keys()
-            and len(self.events[obs_const]) > 0
-        ):
-            OBS.info(
-                f"Responding to '{OBS.event_name(obs_const)}' event with "
-                f"{len(self.events[obs_const])} handler(s)."
-            )
-            return [x() for x in self.events[obs_const]]
+        return True # Not called. OBS opens the OAuth kickoff URL instead.
 
-    #######################################################################
-    def event_add(self, obs_const: int, callback: Callable) -> bool:
-        """
-        Register a callback for a specific OBS event.
+    #----------------------------------------------------------------------
+    def on_twitch_reconnect(
+        self,
+        props, # obs_properties_t
+        prop, # obs_property_t
+    ) -> bool:
+        return True # Not called. OBS opens the OAuth kickoff URL instead.
 
-        The calling context MUST have already called
-        OBS.event_register_router()
-        """
-        self.events[obs_const].append(lambda: callback())
-        OBS.debug(
-            f"Event listener registered for event {OBS.event_name(obs_const)}: {callback.__name__}"
-        )
-
-    #######################################################################
-    def event_start_ticking(self):
-        """
-        Handles a sucessful !brb chat command by registering an OBS
-        "timer" that fires once every second to update the on-screen
-        text source's display count-up time.
-
-        OBS docs specifically warns againt using a python instance method
-        as a timer, so we use a global variable to store the callback.
-
-        Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5/README.md?plain=1#L472
-        """
-        global ticker
-        ticker = lambda: script.on_timer()
-        OBS.timer_add(ticker, 1000) # ms
-
-    #######################################################################
-    def event_stop_ticking(self):
-        global ticker
-        if ticker and ticker is not None:
-            OBS.timer_remove(ticker)
-
-        ticker = None
-
-
-    # ---------------------------------------------------------------------
-    # OBS Frontend Events
-    # ---------------------------------------------------------------------
-
-    #######################################################################
-    def twitch_creds_disconnect(self, props, prop):
+    #----------------------------------------------------------------------
+    def on_twitch_disconnect(
+        self,
+        props, # obs_properties_t
+        prop, # obs_property_t
+    ) -> bool:
         self.twitch.clear_settings()
-        self.settings.to_data() # Write the modified BRBSettings back to the store obs_data_t object?
+        OBS.info('Stored Twitch credentials have been cleared.')
+        return True
 
+    #----------------------------------------------------------------------
+    def on_twitch_oauth_access_token(
+        self,
+        props, # obs_properties_t
+        prop, # obs_property_t
+        settings = None, # obs_data_t
+    ) -> bool:
+        new_token = OBS.data_get(settings, 'twitch_oauth_access_token', 'uh oh')
+        OBS.debug(f"all settings: {OBS.data_get_json(settings)}")
+        OBS.debug(f"Updating oauth token to: {new_token}")
+        self.update_twitch(OBS.data_get_all(settings))
 
-    # ---------------------------------------------------------------------
-    # Chat Command Callbacks
-    # ---------------------------------------------------------------------
+        if self.twitch.creds_expired():
+            OBS.debug("showing reconnect, hiding others")
+            OBS.properties_show(props, [
+                'twitch_reconnect_button',
+                'twitch_reconnect_info',
+            ])
+            OBS.properties_hide(props, [
+                'twitch_connect_button',
+                'twitch_connect_info',
+                'twitch_disconnect_button',
+                'twitch_disconnect_info',
+            ])
+        elif self.twitch.creds_present():
+            OBS.debug("showing disconnect, hiding others")
+            OBS.properties_show(props, [
+                'twitch_disconnect_button',
+                'twitch_disconnect_info',
+            ])
+            OBS.properties_hide(props, [
+                'twitch_connect_button',
+                'twitch_connect_info',
+                'twitch_reconnect_button',
+                'twitch_reconnect_info',
+            ])
+        else:
+            OBS.debug("showing connect, hiding others")
+            OBS.properties_show(props, [
+                'twitch_connect_button',
+                'twitch_connect_info',
+            ])
+            OBS.properties_hide(props, [
+                'twitch_disconnect_button',
+                'twitch_disconnect_info',
+                'twitch_reconnect_button',
+                'twitch_reconnect_info',
+            ])
 
-    #######################################################################
+        return True
+
+    #----------------------------------------------------------------------
+    # def on_irc_start(
+    #     self,
+    #     props, # obs_properties_t
+    #     prop, # obs_property_t
+    # ) -> bool:
+    #     # TODO: start irc if not running, show/hide counterpart buttons
+    #     return True
+
+    #----------------------------------------------------------------------
+    # def on_irc_stop(
+    #     self,
+    #     props, # obs_properties_t
+    #     prop, # obs_property_t
+    # ) -> bool:
+    #     # TODO: stop irc if running, show/hide counterpart buttons
+    #     return True
+
+    #----------------------------------------------------------------------
+    def on_auto_hide_secs(
+        self,
+        props, # obs_properties_t
+        prop, # obs_property_t
+        settings, # obs_data_t
+    ) -> bool:
+        self.settings.auto_hide_secs = int(OBS.data_get(settings, 'auto_hide_secs'))
+        return False
+
+    #----------------------------------------------------------------------
     def on_chat(self, message: ChatMessage) -> None:
         """
         Invoked by the IRC client whenever a chat message is received.
@@ -2699,6 +3034,9 @@ class BRBScript:
         This router is only responsible for determining whether to
         respond to an event and dispatching it, or ignore it.
         """
+
+        # TODO: Implement replies? https://dev.twitch.tv/docs/chat/irc/#replying-to-a-chat-message
+
         match message.message.split()[0]:
             case COMMANDS.BRB:
                 self.command_brb(message)
@@ -2707,112 +3045,142 @@ class BRBScript:
             case COMMANDS.BACK:
                 self.command_back(message)
             case _:
-                pass
+                OBS.debug('No BRB commands matched. Skipping.')
 
-    #######################################################################
-    def command_brb(self, msg: ChatMessage):
+
+    # ---------------------------------------------------------------------
+    # Chat Command Callbacks
+    # ---------------------------------------------------------------------
+
+    #----------------------------------------------------------------------
+    def command_brb(self, msg: ChatMessage) -> None:
         """
-        Handler a !brb command.
+        Handle a !brb command.
         """
+        OBS.debug("Handling !brb.")
         # Validate command was sent by broadcaster or nod.
         if not (msg.is_mod or msg.is_broadcaster):
+            OBS.debug("Only mods can start brb.")
             self.irc.send_chat(MESSAGES.ONLY_MOD_START)
             return
 
         if self.guesses.running():
+            OBS.debug("brb already running.")
             self.irc.send_chat(MESSAGES.ALREADY_RUNNING)
             return
 
         # Remove any leftover timers if this brb was started within a
         # previous auto-hide delay.
+        OBS.debug("Stopping any previous stray tickers.")
         self.event_stop_ticking()
 
         # Open up guessing.
+        OBS.debug("Opening up guessing.")
         self.guesses.start()
 
-        # Schedule 1 second timer updates.
-        self.event_start_ticking()
+        # # Schedule 1 second timer updates.
+        # OBS.debug("Starting on-screen ticker.")
+        # self.event_start_ticking()
 
-        # Show the on-screen timer.
-        self.renderer.show()
+        # # Show the on-screen timer.
+        # OBS.debug("Enabling on-screen timer visibility.")
+        # self.renderer.show()
 
-        # Send the starting chat message.
-        self.irc.send_chat(str.format(
-            MESSAGES.BRB_STARTED,
-            {
-                'streamer': self.settings.twitch_username,
-            },
-        ))
+        # # Send the starting chat message.
+        # self.irc.send_chat(str.format(
+        #     MESSAGES.BRB_STARTED,
+        #     streamer = self.settings.twitch_username,
+        # ))
+        OBS.debug("brb handled.")
 
-    #######################################################################
-    def command_at(self, msg: ChatMessage):
+    #----------------------------------------------------------------------
+    def command_at(self, msg: ChatMessage) -> None:
         """
         Handle an !at command.
         """
+        OBS.debug("Handling !at.")
         if not self.guesses.running():
+            OBS.debug("No brb running.")
             self.irc.send_chat(MESSAGES.NO_BRB)
             return
 
-        parsed_delta = self._parse_at(msg)
+        parsed_delta = self._parse_at(msg.message)
         if not parsed_delta:
+            OBS.error(f"Failed to parse !at in message: {msg}")
             self.irc.send_chat(str.format(
                 MESSAGES.BAD_GUESS,
-                {'user': msg.username},
+                user = msg.username,
+            ))
+            return #
+
+        existing_guess = self.guesses.has_guess(msg.username)
+        if existing_guess:
+            OBS.warn(f"User {msg.username} already has a guess registered: {existing_guess}")
+            self.irc.send_chat(str.format(
+                MESSAGES.ALREADY_GUESSED,
+                user = msg.username,
+                guess = DT.strfdelta(existing_guess),
             ))
             return
 
         if self.guesses.add_guess(msg.username, parsed_delta.total_seconds):
+            OBS.debug(f"Guess registered for user {msg.username}: {parsed_delta}")
             self.irc.send_chat(str.format(
                 MESSAGES.GUESS_ACCEPTED,
-                {
-                    'user': msg.username,
-                    'guess': DT.strfdelta(parsed_delta),
-                },
+                user = msg.username,
+                guess = DT.strfdelta(parsed_delta),
             ))
-            return
 
-        self.irc.send_chat(str.format(
-            MESSAGES.ALREADY_GUESSED,
-            {
-                'user': msg.username,
-                'guess': DT.strfdelta(self.guesses.guesses[msg.username]), # TODO: revisit this to use GuessManager.has_guess().
-            },
-        ))
+        OBS.debug("!at handled.")
 
-    #######################################################################
-    def command_back(self, msg: ChatMessage):
+    #----------------------------------------------------------------------
+    def command_back(self, msg: ChatMessage) -> None:
         """
         Handler that's called when self.irc returns a ChatMessage with
         a !back command.
         """
+        OBS.debug("Handling !back.")
         # Validate command was sent by broadcaster or nod.
         if not (msg.is_mod or msg.is_broadcaster):
+            OBS.debug("Only mods can run !back.")
             self.irc.send_chat(MESSAGES.ONLY_MOD_END)
             return
 
         if not self.guesses.running():
+            OBS.debug("No brb running.")
             self.irc.send_chat(MESSAGES.NO_BRB)
             return
 
         # Disallow further guessing.
-        self.guesses.end()
+        OBS.debug("Stopping guesses.")
+        self.guesses.end(self.settings.auto_hide_secs)
 
         # Announce the winner.
-        self.irc.send_chat(str.format(
-            MESSAGES.BRB_FINISHED,
-            {
-                'streamer': self.settings.twitch_username,
-                'winner': self.guesses.winner,
-                'secs': self.guesses.actual_secs,
-            },
-        ))
+        (winner, *guess_secs) = self.guesses.winner()
+        if winner:
+            OBS.debug(f"!brb winner is: {winner}")
+            self.irc.send_chat(str.format(
+                MESSAGES.BRB_FINISHED,
+                streamer = self.settings.twitch_username,
+                time = DT.duration_str(DT.duration_secs_to_dt(self.guesses.elapsed_time().total_seconds())),
+                winner = winner,
+                diff = DT.duration_str(self.guesses.actual_secs - guess_secs),
+            ))
+        else:
+            OBS.debug("No guesses, so no winner.")
+            self.irc.send_chat(str.format(
+                MESSAGES.BRB_FINISHED_NO_GUESSES,
+                streamer = self.settings.twitch_username,
+                time = DT.duration_str(self.guesses.actual_secs),
+            ))
+        OBS.debug("!back handled.")
 
     # ---------------------------------------------------------------------
     # Internal Helpers
     # ---------------------------------------------------------------------
 
-    #######################################################################
-    def _parse_at(self, msg: str) -> datetime.timedelta|False:
+    #----------------------------------------------------------------------
+    def _parse_at(self, msg: str) -> datetime.timedelta | False:
         """
         Ref: timedelta https://stackoverflow.com/a/51916936/70876
         Ref: regex https://stackoverflow.com/a/8318367/70876
@@ -2820,23 +3188,10 @@ class BRBScript:
         [_cmd, time_str, *_rest] = msg.split()
         delta = DT.strpdelta(time_str)
         if not delta:
-            OBS.debug('Could not parse !at command argument: %s' % (msg))
+            OBS.warn('Could not parse !at command argument: %s' % (msg))
             return False
 
         return delta
-
-    ###########################################################################
-    def changed(self, changed, key) -> bool:
-        """
-        Compares the value of the provided key in the provided `changed`
-        obs_data_t object to the global script.settings value. Return's
-        True if the changed key is present and the value differs from the
-        script's settings.
-        """
-        return (
-            key in changed.keys()
-            and changed[key] != getattr(self.settings, key)
-        )
 
 
 ###########################################################################
@@ -2844,7 +3199,7 @@ class BRBScript:
 ###########################################################################
 
 ticker = None # Must be defined globally cause... OBS says so.
-script = BRBScript()
+script = BRBScript(obs)
 
 
 ###########################################################################
@@ -2852,22 +3207,45 @@ script = BRBScript()
 ###########################################################################
 
 ###########################################################################
-def script_description():
+def script_description() -> str:
     """
+    Describes the script in the OBS GUI.
+
     Uses Qt formatting with a subset of HTML.
 
     Ref: https://doc.qt.io/archives/qt-5.15/richtext-html-subset.html
+    Ref: (for raw svg) https://dashboard.twitch.tv/ > (Nav Menu) > Moderation > Inspect icon
+    Ref: (svg to data uri) https://codeshack.io/svg-to-data-uri-converter/
+    Ref: (color changer) https://www.svggenie.com/tools/svg-color-changer
     """
+    mod_svg = dedent("""
+        <img src="data:image/svg+xml,%3Csvg width='18' height='18' viewBox='0 0 24 24'%3E%3Cpath fill='%23009900' fill-rule='evenodd' d='M15.504 2H22v6.496L10.35 17.35 12 19l-1.5 1.5-2.785-2.785L3.5 22 2 20.5l4.285-4.215L3.5 13.5 5 12l1.65 1.65L15.504 2ZM20 7.504 8.923 15.923l-.846-.846L16.496 4H20v3.504Z' clip-rule='evenodd'%3E%3C/path%3E%3C/svg%3E" alt="Broadcaster and mods only">
+    """.strip())
+
+    cell_style = 'style="background-color: #444444;"'
+
     return dedent(f"""
         <h3><a href="https://github.com/beporter/brb-timer">BRB Timer</a></h3>
 
-        <p>Let chatters guess when the streamer will return from being AFK.</p>
+        <p>Let chatters guess when the streamer will return from being AFK.<br></p>
 
-        <ul>
-            <li><code>{COMMANDS.BRB}</code> (mods only): Start the on-screen timer and allow guessing.</li>
-            <li><code>{COMMANDS.AT} MM:SS</code>: Chatter registers their guess.</li>
-            <li><code>{COMMANDS.BACK}</code> (mods only): Stop the timer and show the winner.</li>
-        </ul>
+        <table cellpadding="3" width="100%">
+            <tr>
+                <td {cell_style} align="center">{mod_svg}</td>
+                <td {cell_style}><code>{COMMANDS.BRB}</code></td>
+                <td {cell_style}>Start the on-screen timer and allow guessing.</td>
+            </tr>
+            <tr>
+                <td {cell_style} align="center">&nbsp;</td>
+                <td {cell_style}><code>{COMMANDS.AT} MM:SS</code> &nbsp; </td>
+                <td {cell_style}>Chatter registers their guess.</td>
+            </tr>
+            <tr>
+                <td {cell_style} align="center">{mod_svg}</td>
+                <td {cell_style}><code>{COMMANDS.BACK}</code></td>
+                <td {cell_style}>Stop the timer and show the winner.</td>
+            </tr>
+        </table>
 
         <!--
         <p>The script requires Twitch API permission to look up your broadcaster (user) name, and channel name. Click the <b>Connect Twitch</b> button to start that process.</p>
@@ -2879,119 +3257,14 @@ def script_description():
     """.strip())
 
 ###########################################################################
-def script_properties():
-    factory = OBSPropsFactory(obs.obs_properties_create())
-
-    factory.button(
-        "create_source",
-        "Create Text Source",
-        script.on_create_source,
-    )
-
-    if script.twitch.creds_expired():
-        # "reonnect_twitch_button" calls `script.twitch_creds_reconnect()`
-        factory.twitch_button(
-            "reconnect",
-            None,
-            obs.OBS_TEXT_INFO_WARNING,
-            (
-                'Twitch token has expired. Please complete the '
-                '[Connect Twitch] process again.'
-            ),
-        )
-    elif not script.twitch.creds_present():
-        # "connect_twitch_button" opens a browser window.
-        factory.twitch_button(
-            "connect",
-            TwitchOAuth.kickoff_url(),
-            obs.OBS_TEXT_INFO_NORMAL,
-            (
-                'Click the [Connect Twitch] button above to generate '
-                'a Twitch API token for this script to use.'
-            ),
-        )
-    else:
-        # "disconnect_twitch_button" calls `script.twitch_creds_disconnect()`
-        factory.twitch_button(
-            "disconnect",
-            None,
-            obs.OBS_TEXT_INFO_ERROR,
-            'Remove stored Twitch OAuth token and cached user details.',
-        )
-
-    factory.text(
-        obs.OBS_TEXT_PASSWORD,
-        "twitch_oauth_access_token",
-        "Twitch OAuth Access Token",
-    )
-
-    # TODO: If irc client is running, show a button to restart it?
-
-    #factory.text(obs.OBS_TEXT_DEFAULT, "bot_username")
-
-    # factory.text_source_list(
-    #     "text_source",
-    #     "Timer Text Source",
-    #     (
-    #         "Select the OBS Text Source from the active scene to use "
-    #         f"to display the count-up timer when {COMMANDS.BRB} is active. "
-    #         "To have the script create one for you, choose '(Add New)'."
-    #     ),
-    # )
-
-    factory.int_with_unit(
-        "auto_hide_secs",
-        "Auto-hide Delay (seconds)",
-        0,       # min
-        30 * 60, # max (30 mins)
-        1,       # step
-        " secs",  # unit
-    )
-
-    script.script_props = factory.props
-
-    return factory.props
-
-###########################################################################
-def script_defaults(settings):
+def script_defaults(
+    settings, # obs_data_t
+): # -> obs_data_t
     """
     This lifecycle methods is called EARLY in the script's startup
     process. Before `script_properties()` is even called for the first
     time.
-
-    The defaults defined here must track with the properties defined
-    above in script_properties().
-
-    If a given property is conditional or doesn't have a default, it
-    still gets a comment here in the proper order to keep the two
-    functions in lock step and so project-wide search turns up both
-    places consistently.
     """
-
-    # "connect_twitch_button": no default
-
-    # "disconnect_twitch_button": no default
-
-    # "reconnect_twitch_button": no default
-
-    # OBS.data_set_default(
-    #     settings,
-    #     "channel_name",
-    #     script.twitch_channel(),
-    # )
-
-    # OBS.data_set_default(
-    #     settings,
-    #     "bot_username",
-    #     DEFAULTS.BOT_USERNAME,
-    # )
-
-    OBS.data_set_default(
-        settings,
-        "text_source",
-        ""
-    )
-
     OBS.data_set_default(
         settings,
         "auto_hide_secs",
@@ -2999,49 +3272,60 @@ def script_defaults(settings):
     )
 
 ###########################################################################
-def script_load(settings):
+def script_properties() -> None: # -> obs_properties_t
+    """
+    Tells OBS what GUI controls to expose for this script.
+    """
+    return script.on_props()
+
+###########################################################################
+def script_load(
+    settings, # obs_data_t
+) -> None:
     """
     Called once when the script is loaded.
     """
     script.on_load(settings)
 
-    OBS.info(f"{SCRIPT_NAME} loaded.")
+    OBS.debug(f"{SCRIPT_NAME} loaded.")
 
 ###########################################################################
-def script_update(changes): # settings: SwigPyObject
+def script_update(
+    settings, # obs_data_t
+) -> None:
     """
     Called by OBS when the user has made modifications to the script's
     configuration in the GUI.
 
+    This method is only responsible for receiving OBS state (in
+    `settings`) and propagating it to this script's runtime state.
+    This is necessary because the OBS state isn't accessible to the
+    script anywhere but in a few of these callbacks.
+
     Ref: https://docs.obsproject.com/scripting#script_update
     """
-    incoming = OBS.data_get_all(changes)
+    script.on_update(settings)
 
-    script.update_twitch(incoming)
-
-    #script.update_renderer()
-
-    # Write our tweaked settings values back to the provided
-    # `settings` data_t object for OBS to persist for us.
-    script.settings.to_data(changes)
-
-    OBS.info(f"{SCRIPT_NAME} settings updated.")
+    OBS.debug(f"{SCRIPT_NAME} settings updated.")
 
 ###########################################################################
-def script_save(settings):
+def script_save(
+    settings, # obs_data_t
+) -> None:
     """
     Called before OBS saves the script settings to the OBS user's local
     storage.
     """
     script.settings_merge(settings)
+    #script.on_props()
 
-    OBS.info(f"{SCRIPT_NAME} settings saved.")
+    OBS.debug(f"{SCRIPT_NAME} settings saved.")
 
 ###########################################################################
-def script_unload():
+def script_unload() -> None:
     """
     Called when OBS unloads the script.
     """
     script.on_unload()
 
-    OBS.info(f"{SCRIPT_NAME} unloaded.")
+    OBS.debug(f"{SCRIPT_NAME} unloaded.")
