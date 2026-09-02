@@ -55,7 +55,7 @@ type ObsButtonCallback = Callable[..., bool]
 type ObsEventCallback = Callable[..., bool]
 type ObsRouterCallback = Callable [[int], None]
 type ObsModifiedCallback = Callable[[], bool]
-type ObsTimerCallback = Callable[[], None]
+type OBSTimer = Callable[[], None]
 type IrcMsgCallback = Callable[[ChatMessage], None]
 
 ###########################################################################
@@ -163,7 +163,9 @@ def dispatch(callback: Callable) -> Callable:
 
     def handle(*args, **kwargs):
         OBS.debug(f"Triggering callback: {callback.__qualname__}")
-        return callback(*args, **kwargs)
+        result = callback(*args, **kwargs)
+        OBS.debug(f"Callback {callback.__qualname__} returning: {result}")
+        return result
 
     return handle
 
@@ -993,7 +995,7 @@ class OBS:
 
 
     # ---------------------------------------------------------------------
-    # Events
+    # Events & Timers
     # ---------------------------------------------------------------------
 
     #----------------------------------------------------------------------
@@ -1033,10 +1035,65 @@ class OBS:
         """
         obs.remove_current_callback()
 
+    #----------------------------------------------------------------------
+    @classmethod
+    def timer_add(self, timer: OBSTimer, millisecs: int) -> OBSTimer:
+        """
+        Creates a new global function named like the provided timer
+        function and adds that global function to OBS as a timer.
+
+        Usage:
+            OBS.timer_add(instance.my_func, millisecs)
+        """
+        func_name = f"__obs_timer_proxy_{timer.__name__}"
+        if func_name in globals().keys():
+            raise ValueError(
+                "Can't shadow the provided timer. Global function "
+                f"already exists: {func_name.__qualname__}"
+            )
+
+        main = sys.modules[__name__]
+        setattr(main, func_name, dispatch(timer))
+        shadow = getattr(main, func_name)
+        obs.timer_add(shadow, millisecs)
+        return shadow
+
+    #----------------------------------------------------------------------
+    @classmethod
+    def timer_remove(self, timer: OBSTimer, throw: bool = False) -> bool:
+        """
+        Remove the provided "clean" timer function from OBS timers.
+
+        Under the hood, this also removes the global function that
+        proxies the calls to satisfy OBS's / SWIG's requirement that
+        timers be top-level module functions.
+        """
+        func_name = f"__obs_timer_proxy_{timer.__name__}"
+        if func_name not in globals().keys():
+            msg = str(
+                f"Can't remove the shadow for the provided timer: {timer} "
+                f"Global function doesn't exist: {func_name}"
+            )
+            if throw:
+                raise ValueError(msg)
+            else:
+                self.debug(msg)
+                return False
+
+        main = sys.modules[__name__]
+        shadow = getattr(main, func_name)
+        obs.timer_remove(shadow)
+        delattr(main, func_name)
+        return True
 
     # ---------------------------------------------------------------------
     # GUI
     # ---------------------------------------------------------------------
+
+    #----------------------------------------------------------------------
+    @classmethod
+    def properties_get(self, props, name: str): # -> obs_property_t
+        return obs.obs_properties_get(props, name)
 
     #----------------------------------------------------------------------
     @classmethod
@@ -1053,21 +1110,23 @@ class OBS:
     @classmethod
     def properties_show(self, props, names: list[str]) -> None:
         for name in names:
-            OBS.debug(f"Checking for property: {name}.")
+            OBS.debug(f"Checking for property to show: {name}.")
             p = obs.obs_properties_get(props, name)
             if p is not None:
                 OBS.debug(f"Making property {name} visible.")
                 obs.obs_property_set_visible(p, True)
+                OBS.debug(f"Property {obs.obs_property_name(p)} visibility is: {'visible' if obs.obs_property_visible(p) else 'hidden'}.")
 
     #----------------------------------------------------------------------
     @classmethod
     def properties_hide(self, props, names: list[str]) -> None:
         for name in names:
-            OBS.debug(f"Checking for property: {name}.")
+            OBS.debug(f"Checking for property to hide: {name}.")
             p = obs.obs_properties_get(props, name)
             if p is not None:
                 OBS.debug(f"Making property {name} hidden.")
                 obs.obs_property_set_visible(p, False)
+                OBS.debug(f"Property {obs.obs_property_name(p)} visibility is: {'visible' if obs.obs_property_visible(p) else 'hidden'}.")
 
 
     # ---------------------------------------------------------------------
@@ -1168,7 +1227,7 @@ class OBSPropsFactory:
             OBS.debug(f"modified_callback is: {modified_callback!r}")
             #self.obs.obs_property_set_modified_callback(p, modified_callback)
             self.obs.obs_property_set_modified_callback(p,
-                lambda props, prop, settings: modified_callback(props, prop, settings),
+                dispatch(modified_callback),
             )
             #self.obs.obs_property_set_modified_callback(p, getattr(script, modified_callback.__name__))
 
@@ -1181,23 +1240,29 @@ class OBSPropsFactory:
         url: str = None,
         text_type: int = obs.OBS_TEXT_INFO_NORMAL, # OBS_TEXT_INFO_*
         long_desc: str = '',
+        show = True,
     ) -> None:
         if url is not None:
-            return self.url_button(
-                f"{keyword}_twitch",
+            b = self.url_button(
+                f"twitch_{keyword}",
                 f"{keyword.capitalize()} Twitch",
                 url,
                 text_type,
                 long_desc,
             )
         else:
-            return self.button(
-                f"{keyword}_twitch",
+            b = self.button(
+                f"twitch_{keyword}",
                 f"{keyword.capitalize()} Twitch",
                 getattr(script, f"on_twitch_{keyword}"),
                 text_type,
                 long_desc,
             )
+
+        if not show:
+            self.obs.obs_property_set_visible(b, show)
+
+        return b
 
     #----------------------------------------------------------------------
     def url_button(
@@ -1212,6 +1277,7 @@ class OBSPropsFactory:
         b = self.button(base_name, label, None, text_type, long_desc, wrap)
         self.obs.obs_property_button_set_type(b, self.obs.OBS_BUTTON_URL)
         self.obs.obs_property_button_set_url(b, url)
+        OBS.debug(f"Creating url button for {base_name} to: {url}")
 
         return b # In case any further modification is desired.
 
@@ -1220,7 +1286,7 @@ class OBSPropsFactory:
         self,
         base_name: str,
         label: str,
-        callback: ObsButtonCallback,
+        callback: ObsButtonCallback = None,
         text_type: int = obs.OBS_TEXT_INFO_NORMAL, # OBS_TEXT_INFO_*
         long_desc: str = '',
         wrap: bool = True,
@@ -1228,23 +1294,26 @@ class OBSPropsFactory:
         """
         Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5/src/example_class.py#L41
         """
+        if callback is None:
+            callback = lambda *args: None
+
         b = self.obs.obs_properties_add_button(
             self.props,
             f"{base_name}_button",
             label,
-            lambda props, prop, settings: callback(props, prop, settings),
+            dispatch(callback),
         )
         # Ref: https://docs.obsproject.com/reference-properties#c.obs_property_set_long_description
         if len(long_desc) > 0:
-            i = self.obs.obs_properties_add_text(
-                self.props,
-                f"{base_name}_info",
-                long_desc,
-                self.obs.OBS_TEXT_INFO,
-            )
-            self.obs.obs_property_text_set_info_type(i, text_type)
-            self.obs.obs_property_text_set_info_word_wrap(i, wrap)
-            # self.obs.obs_property_set_long_description(b, long_desc)
+            # i = self.obs.obs_properties_add_text(
+            #     self.props,
+            #     f"{base_name}_info",
+            #     long_desc,
+            #     self.obs.OBS_TEXT_INFO,
+            # )
+            # self.obs.obs_property_text_set_info_type(i, text_type)
+            # self.obs.obs_property_text_set_info_word_wrap(i, wrap)
+            self.obs.obs_property_set_long_description(b, long_desc)
 
         return b # In case any further modification is desired.
 
@@ -1298,7 +1367,7 @@ class OBSPropsFactory:
         if unit is not None:
             self.obs.obs_property_int_set_suffix(a, unit)
         if modified_callback is not None:
-            self.obs.obs_property_set_modified_callback(a, lambda props, prop, settings: modified_callback(props, prop, settings))
+            self.obs.obs_property_set_modified_callback(a, dispatch(modified_callback))
 
 
 ###########################################################################
@@ -1635,9 +1704,10 @@ class TwitchOAuth:
 
         if (
             self.settings.twitch_oauth_access_token is not None
+            and self.settings.twitch_oauth_access_token != ''
             and self.settings.twitch_oauth_expiry_at is not None
             and self.settings.twitch_oauth_expiry_at != 0
-            and expiry < DT.now()
+            and DT.now() > expiry
         ):
             OBS.info('Stored Twitch OAuth token has expired.')
             return True
@@ -2191,46 +2261,6 @@ class GuessManager:
 
 
 ###########################################################################
-# OBS Timers Wrapper
-###########################################################################
-
-class Timers:
-    """
-    Wrapper around OBS's timer_add and timer_remove to work around a
-    limitation where the python scripting bridge only supports top-level
-    module functions as timers-- they can't be nested as instance methods.
-
-    So this class wraps them in a lambda that the bridge CAN call, and
-    also stores a reference to them to allow for removal (since the
-    lambdas make the _actual_ timer method anonymous.)
-    """
-    entries = {}
-    obs = None
-
-    #----------------------------------------------------------------------
-    def __init__(self, obs_module):
-        self.obs = obs_module
-
-    #----------------------------------------------------------------------
-    def add(self, timer: ObsTimerCallback, millisecs: int) -> ObsTimerCallback:
-        func_name = str(timer)
-        if func_name in self.entries.keys():
-            raise ValueError(f"Timer already exists: {func_name}")
-        self.entries[func_name] = dispatch(timer)
-        self.obs.timer_add(self.entries[func_name], millisecs)
-        return self.entries[func_name]
-
-    #----------------------------------------------------------------------
-    def remove(self, timer: ObsTimerCallback) -> bool:
-        func_name = str(timer)
-        if func_name not in self.entries.keys():
-            raise ValueError(f"Timer does not exist: {func_name}")
-        self.obs.timer_remove(self.entries[func_name])
-        self.entries.pop(func_name, None)
-        return True
-
-
-###########################################################################
 # Timer Renderer
 ###########################################################################
 
@@ -2310,7 +2340,7 @@ class TimerRenderer:
 ###########################################################################
 
 @dataclass
-class BRBSettings(TypedDict):
+class BRBSettings(object):
     """
     Holds the script's internal settings/config data.
 
@@ -2324,12 +2354,12 @@ class BRBSettings(TypedDict):
     Typing is critical here to ensure our to_data() method calls the
     right obs module method.
     """
-    twitch_oauth_access_token: str = None
+    twitch_oauth_access_token: str = ''
     twitch_oauth_expiry_at: int = 0
 
-    twitch_broadcaster_id: int = None
-    twitch_username: str = None
-    twitch_channel: str = None
+    twitch_broadcaster_id: int = 0
+    twitch_username: str = ''
+    twitch_channel: str = ''
 
     auto_hide_secs: int = DEFAULTS.AUTO_HIDE_SECS
 
@@ -2425,7 +2455,6 @@ class BRBScript:
     twitch: TwitchOAuth = TwitchOAuth(settings)
     guesses: GuessManager = GuessManager()
     renderer: Optional[TimerRenderer] = None
-    timers: Timers = Timers(obs)
 
     # This is initialized on an as-needed basis.
     irc: Optional[TwitchIRCClient] = None
@@ -2483,7 +2512,7 @@ class BRBScript:
 
         token unchanged: no op
         token not empty -> token empty: remove local settings
-        token was empty -> token non empty: make api calls with new token
+        token was empty -> token not empty: make api calls with new token
         token not empty -> different token: make api calls with new token
         """
         if (
@@ -2492,7 +2521,7 @@ class BRBScript:
             or changes['twitch_oauth_access_token'].strip() == self.settings.twitch_oauth_access_token
         ):
             OBS.debug(f"No effective change to twitch_oauth_access_token.")
-            return len(self.settings.twitch_oauth_access_token) > 0
+            return self.settings.twitch_oauth_access_token != ''
 
         new_token = changes['twitch_oauth_access_token'].strip()
         if (
@@ -2603,22 +2632,16 @@ class BRBScript:
 
         Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5/README.md?plain=1#L472
         """
-        global ticker
         self.event_stop_ticking()
 
         ticker_lock = False
 
         if ticker_lock: # TODO: Need to ensure we don't start duplicate timers.
-            ticker = script.on_timer
-            OBS.timer_add(ticker, 1 * 1000) # ms
+            OBS.timer_add(self.on_timer, 1 * 1000) # ms
 
     #----------------------------------------------------------------------
     def event_stop_ticking(self) -> None:
-        global ticker
-        if ticker is not None:
-            OBS.timer_remove(ticker)
-
-        ticker = None
+        OBS.timer_remove(self.on_timer)
 
 
     # ---------------------------------------------------------------------
@@ -2635,7 +2658,7 @@ class BRBScript:
         callbacks will be responsible for showing/hiding any counterpart
         widgets.
         """
-        factory = OBSPropsFactory(OBS.properties_create())
+        factory = OBSPropsFactory(obs, OBS.properties_create())
 
         # Currently disabled in favor of auto-create when streaming starts.
         # factory.button(
@@ -2645,28 +2668,31 @@ class BRBScript:
         # )
 
         factory.twitch_button(
-            'connect', # -> no callback because URL is present. (but would be `BRBScript.on_twitch_connect`)
+            'connect', #  -> button id = `twitch_connect_button`. No callback because URL is present (but would be `BRBScript.on_twitch_connect`.)
             TwitchOAuth.kickoff_url(),
             self.obs.OBS_TEXT_INFO_NORMAL,
             (
                 'Open a browser window to obtain '
                 'a Twitch API token for this script to use. '
                 'Paste it below.'
-            )
+            ),
+            (not script.twitch.creds_present()),
         )
 
         factory.twitch_button(
             'reconnect', # -> no callback because URL is present. (but would be `BRBScript.on_twitch_reconnect`)
             TwitchOAuth.kickoff_url(),
             self.obs.OBS_TEXT_INFO_WARNING,
-            'Twitch token has expired. Please obtain a fresh token.'
+            'Twitch token has expired. Please obtain a fresh token.',
+            script.twitch.creds_present() and script.twitch.creds_expired(),
         )
 
         factory.twitch_button(
             'disconnect', # -> BRBScript.on_twitch_disconnect
             None,
             self.obs.OBS_TEXT_INFO_ERROR,
-            'Remove stored Twitch credentials.'
+            'Remove stored Twitch credentials.',
+            script.twitch.creds_present() and not script.twitch.creds_expired(),
         )
 
         factory.text(
@@ -2697,7 +2723,7 @@ class BRBScript:
             " secs", # unit
             script.on_auto_hide_secs
         )
-        OBS.debug(f"script_props returning: {factory.props}")
+
         return factory.props
 
     #----------------------------------------------------------------------
@@ -2770,30 +2796,18 @@ class BRBScript:
         Avoid side-effects here-- leave that to the individual
         `obs_property_set_modified_callback()` handlers.
 
-        Can't affect GUI widgets, only stored data.
+        Can't affect GUI widgets directly, only stored data.
         """
-        # incoming = OBS.data_get_all(changed_settings)
+        #OBS.debug(f"changed settings: {OBS.data_get_json(changed_settings)}")
+        incoming = OBS.data_get_all(changed_settings)
 
-        # script.update_twitch(incoming)
+        script.update_twitch(incoming)
+        #OBS.debug(f"BRBSettings after update_twitch: {self.settings!s}")
 
         # Write our tweaked settings values back to the provided
-        # `settings` data_t object for OBS to persist for us.
+        # `settings` obs_data_t object for OBS to persist for us.
         script.settings.to_data(changed_settings)
-
-
-        # # Update GUI properties.
-        # #script.on_props()
-        # OBS.debug(f"props = {props}, prop = {obs.obs_property_name(prop)}, settings = {OBS.data_get_json(settings)}")
-        # auto_hide_val = OBS.data_get_all(settings)['auto_hide_secs']
-        # #auto_hide_prop = obs.obs_properties_get(props, 'auto_hide_secs')
-
-        # obs.obs_property_set_description(prop, f"auto hide {auto_hide_val}")
-
-
-        # OBS.debug(f"props = {props}, prop = {prop}, settings = {OBS.data_get_json(settings)}")
-
-        # OBS.debug("Forcing GUI property refresh.")
-        # return True
+        #OBS.debug(f"changed settings after update_twitch: {OBS.data_get_json(changed_settings)}")
 
     #----------------------------------------------------------------------
     # ✅
@@ -2954,13 +2968,13 @@ class BRBScript:
         prop, # obs_property_t
         settings = None, # obs_data_t
     ) -> bool:
-        new_token = OBS.data_get(settings, 'twitch_oauth_access_token', 'uh oh')
-        OBS.debug(f"all settings: {OBS.data_get_json(settings)}")
-        OBS.debug(f"Updating oauth token to: {new_token}")
+        #new_token = OBS.data_get(settings, 'twitch_oauth_access_token', 'uh oh')
+        #OBS.debug(f"all settings: {OBS.data_get_json(settings)}")
+        #OBS.debug(f"Updating oauth token to: {new_token}")
         self.update_twitch(OBS.data_get_all(settings))
 
         if self.twitch.creds_expired():
-            OBS.debug("showing reconnect, hiding others")
+            OBS.debug("expired: show reconnects")
             OBS.properties_show(props, [
                 'twitch_reconnect_button',
                 'twitch_reconnect_info',
@@ -2972,7 +2986,7 @@ class BRBScript:
                 'twitch_disconnect_info',
             ])
         elif self.twitch.creds_present():
-            OBS.debug("showing disconnect, hiding others")
+            OBS.debug("creds: show disconnect")
             OBS.properties_show(props, [
                 'twitch_disconnect_button',
                 'twitch_disconnect_info',
@@ -2984,7 +2998,7 @@ class BRBScript:
                 'twitch_reconnect_info',
             ])
         else:
-            OBS.debug("showing connect, hiding others")
+            OBS.debug("no creds: show connect")
             OBS.properties_show(props, [
                 'twitch_connect_button',
                 'twitch_connect_info',
