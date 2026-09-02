@@ -67,6 +67,16 @@ Split into a few distinct parts, because OBS doesn't request all of the necessar
 
 ## Example lifecycle
 
+![conceptual lifecycle flow diagram](docs/obs-python-lifecycle.dot.svg)
+
+- script_update(settings) --> Import passed obs_data_t settings to runtime config.
+- on_prop_modified(prop) --> Use the state of props (like clicks) to update runtime, trigger side effects, and to signal a GUI redraw is needed.
+- script_properties() --> Use the script's runtime data (**not** OBS's persistent obs_data_t settings!) to draw GUI.
+
+1. OBS loads > calls script_update() with any persisted data to update runtime state.
+2. OBS calls script_properties() > empty or populated runtime state dictates initial GUI > OBS fills GUI values from its own persistent data (which has been updated by script_update() already) > ...
+3. GUI changes from OBS or user trigger prop modified callbacks > callbacks use already-updated runtime state and prop activity to perform side-effects like api calls, creating Sources, starting/stopping irc client socket, etc.
+
 <table><!-- markdownlint-disable MD033 -->
 <thead>
     <tr>

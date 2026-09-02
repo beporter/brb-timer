@@ -1,0 +1,41 @@
+// Generate an svg with:
+//    `dot docs/obs-python-lifecycle.dot -Tsvg -O`
+// Requires the graphviz library (`brew install graphviz`)
+digraph G {
+  label="OBS Python Scripting Lifecycle"
+  URL="https://docs.obsproject.com/scripting"
+  splines=spline // curved line ortho polyline spline
+
+  graph [nodesep=0.8 ranksep=0.8];
+  edge [labelfloat=false decorate=false];
+
+  user [label="User" shape="house"];
+  obs [label="OBS" shape="box3d"];
+  state [label="Python script state" shape="cylinder"];
+  side_effects [label="(side effects)" shape="note"];
+
+  {
+    group="functions";
+    rank="same";
+
+    script_update [label="script_update()" shape="cds"];
+    script_props [label="script_properties()" shape="cds"];
+    callbacks [label="on_modified_*()" shape="cds"];
+  }
+
+  obs -> script_update [label="  1. OBS boots" color="#aa0000"];
+  script_update -> state [label="  2. Import persisted settings" color="#aa0000"];
+  state -> script_props [label="3. Generate GUI widgets"];
+  script_props -> obs [label="4. Provide GUI widgets"];
+
+  user -> obs [label="  5. Interacts with GUI" color="#0000aa"];
+  obs -> callbacks [label="6. Widgets call their callbacks" color="#0000aa" ];
+  callbacks -> state [label="7a. Callbacks update state"];
+  callbacks -> side_effects [label="7b. Callbacks trigger side effects"];
+
+  /*
+  Ref: https://gitlab.com/graphviz/graphviz/-/work_items/483
+
+  image="data:image/svg+xml,%3Csvg xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22 viewBox%3D%220 0 24 24%22%3E%3Ccircle cx%3D%2212%22 cy%3D%228%22 r%3D%223.5%22 fill%3D%22none%22 stroke%3D%22black%22 stroke-width%3D%220.5%22%2F%3E%3Cpath d%3D%22M4 20c.8-4 3.7-6 8-6s7.2 2 8 6%22 fill%3D%22none%22 stroke%3D%22black%22 stroke-width%3D%220.5%22 stroke-linecap%3D%22round%22%2F%3E%3C%2Fsvg%3E"
+  */
+}
