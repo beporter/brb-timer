@@ -1,0 +1,18 @@
+# Coverage config.
+# Ref: https://coverage.readthedocs.io/en/7.16.0/config.html#sample-file
+
+[run]
+command_line = -m unittest discover
+source = brb_timer
+omit=tests/
+
+branch = True
+
+[report]
+fail_under = 25
+#skip_covered = True
+skip_empty = True
+ignore_errors = True
+
+[html]
+directory = tmp/coverage/
