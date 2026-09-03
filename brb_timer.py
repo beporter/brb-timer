@@ -265,8 +265,7 @@ class DT:
         """
         Format the provided TimeDelta object as a `[[HH:]MM:]SS` string.
         """
-        return datetime.datetime.strftime(
-            delta,
+        return (self.epoch() + delta).strftime(
             self.duration_fmt(delta.total_seconds()),
         )
 
@@ -314,7 +313,9 @@ class DT:
             case 'int' | 'float':
                 secs = int(elapsed)
             case 'datetime': # Ignore year/month/day.
-                secs = (elapsed.replace(year = None, month = None, day = None) - self.epoch()).total_seconds()
+                if elapsed.tzname() is None:
+                    elapsed = elapsed.astimezone(datetime.timezone.utc)
+                secs = (elapsed - self.epoch()).total_seconds()
             case 'timedelta':
                 secs = elapsed.total_seconds()
             case _:
@@ -323,13 +324,14 @@ class DT:
         # Can't strftime a timedelta object. So just add the delta to
         # an epoch datetime object since we're only displaying
         # hours/mins/secs anyway.
-        dt = self.epoch() + elapsed
+        dt = self.epoch() + self.secs_to_delta(secs)
+        fmt = self.duration_fmt(secs)
 
-        return dt.strftime(self._duration_fmt(secs))
+        return dt.strftime(fmt)
 
     #----------------------------------------------------------------------
     @classmethod
-    def duration_fmt(secs: int) -> str:
+    def duration_fmt(self, secs: int) -> str:
         """
         Using the provided integer secs, return the shortest possible
         formatting string.
@@ -338,9 +340,9 @@ class DT:
             DT.duration_fmt(90) -> '%M:%S'
             DT.duration_fmt(7200) -> '%H:%M:%S'
         """
-        if secs > 3600:
+        if secs >= 3600:
             fmt = '%H:%M:%S'
-        elif secs > 60:
+        elif secs >= 60:
             fmt = '%M:%S'
         else:
             fmt = '%S secs'
@@ -1037,19 +1039,40 @@ class OBS:
 
     #----------------------------------------------------------------------
     @classmethod
+    def timer_name(self, timer_func: OBSTimer) -> str:
+        TIMER_FUNC_PREFIX: str = '__obs_timer_proxy__'
+        return f"{TIMER_FUNC_PREFIX}{timer_func.__name__}"
+
+    #----------------------------------------------------------------------
+    @classmethod
+    def timer_running(self, timer_func: OBSTimer) -> bool:
+        """
+        This is a bit crude since the actual timer method gets called
+        repeatedly, but the existence of the module level proxy function
+        is 'good enough' for our needs.
+        """
+        return self.timer_name(timer_func) in globals().keys()
+
+    #----------------------------------------------------------------------
+    @classmethod
     def timer_add(self, timer: OBSTimer, millisecs: int) -> OBSTimer:
         """
         Creates a new global function named like the provided timer
         function and adds that global function to OBS as a timer.
 
+        OBS docs specifically warns againt using a python instance
+        method as a timer.
+
         Usage:
             OBS.timer_add(instance.my_func, millisecs)
+
+        Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5/README.md?plain=1#L472
         """
-        func_name = f"__obs_timer_proxy_{timer.__name__}"
+        func_name = self.timer_name(timer)
         if func_name in globals().keys():
             raise ValueError(
                 "Can't shadow the provided timer. Global function "
-                f"already exists: {func_name.__qualname__}"
+                f"already exists: {func_name}"
             )
 
         main = sys.modules[__name__]
@@ -1068,7 +1091,7 @@ class OBS:
         proxies the calls to satisfy OBS's / SWIG's requirement that
         timers be top-level module functions.
         """
-        func_name = f"__obs_timer_proxy_{timer.__name__}"
+        func_name = self.timer_name(timer)
         if func_name not in globals().keys():
             msg = str(
                 f"Can't remove the shadow for the provided timer: {timer} "
@@ -1108,25 +1131,36 @@ class OBS:
 
     #----------------------------------------------------------------------
     @classmethod
-    def properties_show(self, props, names: list[str]) -> None:
-        for name in names:
-            OBS.debug(f"Checking for property to show: {name}.")
-            p = obs.obs_properties_get(props, name)
-            if p is not None:
-                OBS.debug(f"Making property {name} visible.")
-                obs.obs_property_set_visible(p, True)
-                OBS.debug(f"Property {obs.obs_property_name(p)} visibility is: {'visible' if obs.obs_property_visible(p) else 'hidden'}.")
+    def properties_visibility_set(
+        self,
+        props,
+        prop_names: dict[str, bool],
+    ) -> bool:
+        for name, show in prop_names.items():
+            if show:
+                self.property_show(props, name)
+            else:
+                self.property_hide(props, name)
 
     #----------------------------------------------------------------------
     @classmethod
-    def properties_hide(self, props, names: list[str]) -> None:
-        for name in names:
-            OBS.debug(f"Checking for property to hide: {name}.")
-            p = obs.obs_properties_get(props, name)
-            if p is not None:
-                OBS.debug(f"Making property {name} hidden.")
-                obs.obs_property_set_visible(p, False)
-                OBS.debug(f"Property {obs.obs_property_name(p)} visibility is: {'visible' if obs.obs_property_visible(p) else 'hidden'}.")
+    def property_show(self, props, name: str) -> None:
+        OBS.debug(f"Checking for property to show: {name}.")
+        p = obs.obs_properties_get(props, name)
+        if p is not None:
+            OBS.debug(f"Making property {name} visible.")
+            obs.obs_property_set_visible(p, True)
+            OBS.debug(f"Property {obs.obs_property_name(p)} visibility is: {'visible' if obs.obs_property_visible(p) else 'hidden'}.")
+
+    #----------------------------------------------------------------------
+    @classmethod
+    def property_hide(self, props, name: str) -> None:
+        OBS.debug(f"Checking for property to hide: {name}.")
+        p = obs.obs_properties_get(props, name)
+        if p is not None:
+            OBS.debug(f"Making property {name} hidden.")
+            obs.obs_property_set_visible(p, False)
+            OBS.debug(f"Property {obs.obs_property_name(p)} visibility is: {'visible' if obs.obs_property_visible(p) else 'hidden'}.")
 
 
     # ---------------------------------------------------------------------
@@ -1963,26 +1997,26 @@ class TwitchIRCClient:
             try:
                 self._connect()
                 while self.running:
-                    OBS.debug("Reading line...")
+                    #OBS.debug("Reading line...")
                     line = self.reader.readline()
                     if not line:
                         #continue
                         raise ConnectionError("EOF")
 
-                    OBS.debug(f"Handling line: {line}")
+                    #OBS.debug(f"Handling line: {line}")
                     self._handle_line(line.rstrip())
 
             except ConnectionError:
                 pass
 
             except Exception as ex:
-                OBS.warn(f"TwitchIRC: {ex}")
+                OBS.warn(f"Twitch IRC Listener: {ex!r}")
                 try:
                     if self.socket:
                         OBS.debug("Closing socket.")
                         self.socket.close()
                 except Exception as e:
-                    OBS.debug(f"Failed to close socket: {e}")
+                    OBS.debug(f"Failed to close socket: {e!r}")
 
                 OBS.debug(f"Sleeping for {self.RECONNECT_DELAY} secs.")
                 time.sleep(self.RECONNECT_DELAY)
@@ -2029,7 +2063,8 @@ class TwitchIRCClient:
                 ("broadcaster/1" in tags.get("badges", "")), # is_broadcaster
             )
 
-        except Exception:
+        except Exception as e:
+            OBS.debug(e)
             return None
 
     #----------------------------------------------------------------------
@@ -2056,7 +2091,7 @@ class TwitchIRCClient:
 ###########################################################################
 
 @dataclass
-class ChatMessage(TypedDict):
+class ChatMessage(object):
     """
     Message passing container from the IRC client to the command parser.
     """
@@ -2206,16 +2241,17 @@ class GuessManager:
         self.active = False
 
         self.stop_time = DT.now()
-        self.actual_secs = self.stop_time - self.start_time
-
-        self.auto_hide_time = DT.duration_secs_to_dt(auto_hide_secs)
+        self.actual_secs = (self.stop_time - self.start_time).total_seconds()
+        self.auto_hide_time = self.stop_time + DT.secs_to_delta(auto_hide_secs)
 
     #----------------------------------------------------------------------
     def winner(self) -> tuple[str, int]:
         """
-        Returns false if no !brb has run, or is still running, or if nobody registered any guesses.
+        Returns false if no !brb has run, or is still running, or if
+        nobody registered any guesses.
 
-        Returns a tuple of (username, guessed_secs) when a winner is present.
+        Returns a tuple of (username, guessed_secs) when a winner is
+        present.
         """
         if self.active:
             return False # No winner when brb is still active.
@@ -2774,7 +2810,10 @@ class BRBScript:
 
         # Create the text source if it doesn't already exist.
         if not OBS.source_exists(SOURCES.TEXT_TIMER):
-            OBS.debug(f"Creating on-screen timer text source named: {SOURCES.TEXT_TIMER}")
+            OBS.debug(
+                "Creating on-screen timer text source "
+                f"named: {SOURCES.TEXT_TIMER}"
+            )
             self.on_create_source()
 
         OBS.info(f"{SCRIPT_NAME} ready!")
@@ -2871,7 +2910,7 @@ class BRBScript:
             self.on_chat,
         )
         self.irc.start()
-        OBS.info(f"{SCRIPT_NAME} IRC chat bot started.")
+        OBS.info(f"{SCRIPT_NAME} chat bot started.")
 
         # TODO: show/hide prop buttons? Can't do that here cause they're not args.
 
@@ -2933,35 +2972,6 @@ class BRBScript:
     # ---------------------------------------------------------------------
 
     #----------------------------------------------------------------------
-    def on_twitch_connect(
-        self,
-        props, # obs_properties_t
-        prop, # obs_property_t
-    ) -> bool:
-        """
-        GUI button click handler.
-        """
-        return True # Not called. OBS opens the OAuth kickoff URL instead.
-
-    #----------------------------------------------------------------------
-    def on_twitch_reconnect(
-        self,
-        props, # obs_properties_t
-        prop, # obs_property_t
-    ) -> bool:
-        return True # Not called. OBS opens the OAuth kickoff URL instead.
-
-    #----------------------------------------------------------------------
-    def on_twitch_disconnect(
-        self,
-        props, # obs_properties_t
-        prop, # obs_property_t
-    ) -> bool:
-        self.twitch.clear_settings()
-        OBS.info('Stored Twitch credentials have been cleared.')
-        return True
-
-    #----------------------------------------------------------------------
     def on_twitch_oauth_access_token(
         self,
         props, # obs_properties_t
@@ -2973,62 +2983,8 @@ class BRBScript:
         #OBS.debug(f"Updating oauth token to: {new_token}")
         self.update_twitch(OBS.data_get_all(settings))
 
-        if self.twitch.creds_expired():
-            OBS.debug("expired: show reconnects")
-            OBS.properties_show(props, [
-                'twitch_reconnect_button',
-                'twitch_reconnect_info',
-            ])
-            OBS.properties_hide(props, [
-                'twitch_connect_button',
-                'twitch_connect_info',
-                'twitch_disconnect_button',
-                'twitch_disconnect_info',
-            ])
-        elif self.twitch.creds_present():
-            OBS.debug("creds: show disconnect")
-            OBS.properties_show(props, [
-                'twitch_disconnect_button',
-                'twitch_disconnect_info',
-            ])
-            OBS.properties_hide(props, [
-                'twitch_connect_button',
-                'twitch_connect_info',
-                'twitch_reconnect_button',
-                'twitch_reconnect_info',
-            ])
-        else:
-            OBS.debug("no creds: show connect")
-            OBS.properties_show(props, [
-                'twitch_connect_button',
-                'twitch_connect_info',
-            ])
-            OBS.properties_hide(props, [
-                'twitch_disconnect_button',
-                'twitch_disconnect_info',
-                'twitch_reconnect_button',
-                'twitch_reconnect_info',
-            ])
-
+        self.update_prop_visibility(props)
         return True
-
-    #----------------------------------------------------------------------
-    # def on_irc_start(
-    #     self,
-    #     props, # obs_properties_t
-    #     prop, # obs_property_t
-    # ) -> bool:
-    #     # TODO: start irc if not running, show/hide counterpart buttons
-    #     return True
-
-    #----------------------------------------------------------------------
-    # def on_irc_stop(
-    #     self,
-    #     props, # obs_properties_t
-    #     prop, # obs_property_t
-    # ) -> bool:
-    #     # TODO: stop irc if running, show/hide counterpart buttons
-    #     return True
 
     #----------------------------------------------------------------------
     def on_auto_hide_secs(
@@ -3209,14 +3165,6 @@ class BRBScript:
 
 
 ###########################################################################
-# Global Script Instance
-###########################################################################
-
-ticker = None # Must be defined globally cause... OBS says so.
-script = BRBScript(obs)
-
-
-###########################################################################
 # OBS Script API
 ###########################################################################
 
@@ -3290,7 +3238,14 @@ def script_properties() -> None: # -> obs_properties_t
     """
     Tells OBS what GUI controls to expose for this script.
     """
-    return script.on_props()
+    props = script.on_props()
+    if props is not None:
+        OBS.debug(f"{SCRIPT_NAME} properties generated.")
+    else:
+        OBS.debug(f"{SCRIPT_NAME} property generation failed.")
+
+    return props
+
 
 ###########################################################################
 def script_load(
@@ -3331,7 +3286,6 @@ def script_save(
     storage.
     """
     script.settings_merge(settings)
-    #script.on_props()
 
     OBS.debug(f"{SCRIPT_NAME} settings saved.")
 
@@ -3343,3 +3297,19 @@ def script_unload() -> None:
     script.on_unload()
 
     OBS.debug(f"{SCRIPT_NAME} unloaded.")
+
+###########################################################################
+# Global Script Instance
+###########################################################################
+
+script = None
+
+def main():
+    global script
+    script = BRBScript(obs)
+
+if __name__ == "__main__":
+    main()
+
+
+
