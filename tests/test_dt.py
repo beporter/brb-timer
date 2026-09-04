@@ -9,11 +9,9 @@ class TestDT(unittest.TestCase):
 
     def setUp(self):
         pass
-        #self.widget = Widget('The widget')
 
     def tearDown(self):
         pass
-        #self.widget.dispose()
 
     def test_epoch_secs_to_dt(self):
         self.assertEqual(

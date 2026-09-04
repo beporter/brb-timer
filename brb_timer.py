@@ -4,6 +4,7 @@ https://github.com/beporter/brb-timer
 """
 
 from __future__ import annotations
+import builtins
 from collections import defaultdict
 import contextlib
 from dataclasses import dataclass
@@ -14,13 +15,14 @@ import inspect
 import json
 import logging
 import re
+import select
 import socket
 import ssl
 import sys
 from textwrap import dedent
 import threading
 import time
-from typing import Callable, Dict, Optional, TypedDict
+from typing import Any, Callable, Dict, Optional
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -349,6 +351,23 @@ class DT:
 
         return fmt
 
+    #----------------------------------------------------------------------
+    @classmethod
+    def normalize_to_dt(
+        self,
+        input: Any,
+    ) -> datetime.datetime:
+        match type(input):
+            case datetime.datetime:
+                return input
+            case builtins.str:
+                return self.iso_str_to_dt(input)
+            case builtins.int | builtins.float:
+                return self.epoch_secs_to_dt(int(input))
+            case _:
+                OBS.warn(f"Fell through DT normalization: {input} ({type(input).__name__})")
+                return self.epoch_secs_to_dt(0)
+
 
 ###########################################################################
 # OBS Module Wrapper
@@ -410,7 +429,8 @@ class OBS:
             yield source
 
         finally:
-            obs.obs_source_release(source)
+            if source is not None:
+                obs.obs_source_release(source)
 
     #----------------------------------------------------------------------
     @classmethod
@@ -441,7 +461,8 @@ class OBS:
         #         raise e
 
         finally:
-            obs.obs_source_release(source)
+            if source is not None:
+                obs.obs_source_release(source)
 
     #----------------------------------------------------------------------
     @classmethod
@@ -469,7 +490,8 @@ class OBS:
                 yield source
 
             finally:
-                obs.obs_source_release(source)
+                if source is not None:
+                    obs.obs_source_release(source)
 
     #----------------------------------------------------------------------
     @classmethod
@@ -575,8 +597,10 @@ class OBS:
             yield scene
 
         finally:
-            obs.obs_source_release(scene_source)
-            obs.obs_scene_release(scene)
+            if scene_source is not None:
+                obs.obs_source_release(scene_source)
+            if scene is not None:
+                obs.obs_scene_release(scene)
 
 
     # ---------------------------------------------------------------------
@@ -607,7 +631,8 @@ class OBS:
             yield sceneitem
 
         finally:
-            obs.obs_sceneitem_release(sceneitem)
+            if sceneitem is not None:
+                obs.obs_sceneitem_release(sceneitem)
 
     #----------------------------------------------------------------------
     @classmethod
@@ -631,7 +656,8 @@ class OBS:
             yield sceneitem
 
         finally:
-            obs.obs_sceneitem_release(sceneitem)
+            if sceneitem is not None:
+                obs.obs_sceneitem_release(sceneitem)
 
     #----------------------------------------------------------------------
     @classmethod
@@ -729,7 +755,7 @@ class OBS:
         transition_type: str,
         visibility: str,
         direction: str,
-    ) -> str | False:
+    ):
         """
         Creates a new transition Source object with the provided settings.
 
@@ -760,7 +786,8 @@ class OBS:
                 yield transition
 
         finally:
-            obs.obs_source_release(transition)
+            if transition is not None:
+                obs.obs_source_release(transition)
 
     #----------------------------------------------------------------------
     @classmethod
@@ -865,7 +892,8 @@ class OBS:
             yield data
 
         finally:
-            obs.obs_data_release(data)
+            if data is not None:
+                obs.obs_data_release(data)
 
     #----------------------------------------------------------------------
     @classmethod
@@ -1254,18 +1282,14 @@ class OBSPropsFactory:
         p = self.obs.obs_properties_add_text(
             self.props,
             name,
-            label if label is not None else label.replace("_", " ").capitalize(),
+            label if label is not None else name.replace("_", " ").capitalize(),
             type,
         )
         if modified_callback is not None:
-            OBS.debug(f"modified_callback is: {modified_callback!r}")
-            #self.obs.obs_property_set_modified_callback(p, modified_callback)
+            #OBS.debug(f"modified_callback is: {modified_callback!r}")
             self.obs.obs_property_set_modified_callback(p,
                 dispatch(modified_callback),
             )
-            #self.obs.obs_property_set_modified_callback(p, getattr(script, modified_callback.__name__))
-
-            ##self.obs.obs_property_set_modified_callback(p, on_list_modified)
 
     #----------------------------------------------------------------------
     def twitch_button(
@@ -1420,20 +1444,11 @@ class SourceGenerator:
     HIDE_TRANSITION_DIR = "right"
     TRANSITION_DURATION_MS = 300
 
-    def __init__(
-        self,
-        source_name,
-        text = "hello world",
-        text_source_id = None,
-    ):
-        self.text_source_name = source_name
-        self.text = text
-        self.text_source_id = text_source_id
-
     #----------------------------------------------------------------------
     @classmethod
     def create_source(
         self,
+        OBS: OBS, # BRBTimer.OBS class (not an instance)
         source_name: str,
         text: str = "hello world",
         text_source_id: str = None, # Differs by platform. See OBS.source_create_text
@@ -1485,9 +1500,9 @@ class SourceGenerator:
 
                     with OBS.transition_source_create(
                         SOURCES.TRANSITION_SHOW,
-                        "slide_transition",
+                        self.SHOW_TRANSITION_TYPE,
                         'show',
-                        "left",
+                        self.SHOW_TRANSITION_DIR,
                     ) as show_trans:
                         OBS.source_save(show_trans)
                         OBS.sceneitem_add_transition(
@@ -1499,9 +1514,9 @@ class SourceGenerator:
 
                     with OBS.transition_source_create(
                         SOURCES.TRANSITION_HIDE,
-                        "slide_transition",
+                        self.HIDE_TRANSITION_TYPE,
                         'hide',
-                        "right",
+                        self.HIDE_TRANSITION_DIR,
                     ) as hide_trans:
                         OBS.source_save(hide_trans)
                         OBS.sceneitem_add_transition(
@@ -1578,7 +1593,7 @@ class TwitchApi:
             )
             return False
 
-        if not resp.get('data') and resp.get('data', []).get(0):
+        if not resp.get('data') or not resp.get('data', [False])[0]:
             OBS.error(
                 "No channel data returned for "
                 f"broadcaster_id: {broadcaster_id}"
@@ -1619,22 +1634,26 @@ class TwitchApi:
             with urllib.request.urlopen(req) as r:
                 return json.load(r)
         except urllib.error.HTTPError as e:
-            if e.code == 401:
-                try:
-                    detail = json.load(e["message"])
-                except Exception:
-                    detail = "unauthorized"
+            match e.code:
+                case 401:
+                    try:
+                        detail = json.load(e.fp)
+                    except Exception:
+                        detail = "unauthorized"
 
-            # Ref: https://dev.twitch.tv/docs/api/guide/#twitch-rate-limits
-            if e.code == http.HTTPStatus.TOO_MANY_REQUESTS:
-                total = e.headers.get('Ratelimit-Limit')
-                remaining = e.headers.get('Ratelimit-Remaining')
-                reset = DT.epoch_secs_to_dt(e.headers.get('Ratelimit-Reset'))
-                detail = (
-                    f"Rquest for {e.url()} was rate limited. "
-                    f"({remaining}/{total} requests remaining. "
-                    f"Reset at {reset.strptime()}.)"
-                )
+                # Ref: https://dev.twitch.tv/docs/api/guide/#twitch-rate-limits
+                case http.HTTPStatus.TOO_MANY_REQUESTS:
+                    total = e.headers.get('Ratelimit-Limit')
+                    remaining = e.headers.get('Ratelimit-Remaining')
+                    reset = DT.epoch_secs_to_dt(e.headers.get('Ratelimit-Reset'))
+                    detail = (
+                        f"Request for {e.url} was rate limited. "
+                        f"({remaining}/{total} requests remaining. "
+                        f"Reset at {reset!s}.)"
+                    )
+
+                case _:
+                    detail = e.reason
 
             OBS.error(detail)
 
@@ -1695,7 +1714,8 @@ class TwitchOAuth:
 
     #----------------------------------------------------------------------
     def __init__(self, settings: BRBSettings):
-        self.settings = settings
+        self.settings: BRBSettings = settings
+        self.api: Optional[TwitchApi] = None # Initialized on use.
 
     #----------------------------------------------------------------------
     @classmethod
@@ -1727,14 +1747,13 @@ class TwitchOAuth:
 
     #----------------------------------------------------------------------
     def creds_expired(self) -> bool:
-        if isinstance(self.settings.twitch_oauth_expiry_at, datetime.datetime):
-            expiry = self.settings.twitch_oauth_expiry_at
-            self.settings.twitch_oauth_expiry_at = int(expiry.timestamp())
-        elif isinstance(self.settings.twitch_oauth_expiry_at, str):
-            expiry = DT.iso_str_to_dt(self.settings.twitch_oauth_expiry_at)
-            self.settings.twitch_oauth_expiry_at = int(expiry.timestamp())
-        else:
-            expiry = DT.epoch_secs_to_dt(int(self.settings.twitch_oauth_expiry_at))
+        expiry = DT.normalize_to_dt(
+            self.settings.twitch_oauth_expiry_at
+        )
+
+        self.settings.twitch_oauth_expiry_at = int(
+            expiry.timestamp(),
+        )
 
         if (
             self.settings.twitch_oauth_access_token is not None
@@ -1877,21 +1896,11 @@ class TwitchIRCClient:
 
     1. Recieving messages:
 
-        socket
-            ↓
-        IRC parsing
-            ↓
-        ChatMessage objects
-            ↓
-        BRBScript command parser
+        socket > IRC parsing > ChatMessage objects > BRBScript command parser
 
     2. Sending messages:
 
-        BRBScript
-            ↓
-        IRC parsing
-            ↓
-        socket
+        BRBScript > IRC parsing >socket
 
     It knows nothing about `!brb`, `!at`, timers, guesses, etc. and
     encodes its message parsing into ChatMessage payloads to keep raw
@@ -1915,15 +1924,18 @@ class TwitchIRCClient:
         self.callback = callback
 
         self.socket = None
-        self.reader = None
         self.send_lock = threading.Lock()
         self.running = False
         self.thread = None
+
+        self._create_wakeup_pair()
 
     #----------------------------------------------------------------------
     def start(self) -> None:
         if self.running:
             return
+
+        self._drain_wakeup()
 
         self.running = True
         self.thread = threading.Thread(
@@ -1933,7 +1945,6 @@ class TwitchIRCClient:
         )
 
         OBS.debug("Starting IRC thread.")
-
         self.thread.start()
 
     #----------------------------------------------------------------------
@@ -1941,17 +1952,37 @@ class TwitchIRCClient:
         self.running = False
 
         try:
+            if self.wakeup_writer:
+                self.wakeup_writer.send(b"\x00")
+        except Exception as e:
+            OBS.debug(f"Failed to wake IRC thread: {e!r}")
+
+        try:
             if self.socket:
                 OBS.debug("Closing irc socket.")
                 self.socket.shutdown(socket.SHUT_RDWR)
                 self.socket.close()
                 #self.thread.join() # wait for the thread to terminate.
-            if self.thread.is_alive():
+            if self.thread and self.thread.is_alive():
                 OBS.debug("Stopping background thread.")
 
         except Exception as e:
-            OBS.debug(f"Failed to close socket: {e}")
-            pass
+            OBS.debug(f"Failed to close socket: {e!r}")
+
+    #----------------------------------------------------------------------
+    def close(self):
+        self.stop()
+
+        for sock in (self.wakeup_reader, self.wakeup_writer):
+            try:
+                if sock is not None:
+                    sock.close()
+            except OSError:
+                pass
+
+        self.wakeup_reader = None
+        self.wakeup_writer = None
+        self.socket = None
 
     #----------------------------------------------------------------------
     def send_chat(self, message: str) -> None:
@@ -1962,55 +1993,87 @@ class TwitchIRCClient:
     # ---------------------------------------------------------------------
 
     #----------------------------------------------------------------------
+    def _create_wakeup_pair(self):
+        self.wakeup_reader, self.wakeup_writer = socket.socketpair()
+
+   #----------------------------------------------------------------------
+    def _drain_wakeup(self):
+        self.wakeup_reader.setblocking(False)
+
+        try:
+            while self.wakeup_reader.recv(4096):
+                pass
+        except BlockingIOError:
+            pass
+        finally:
+            self.wakeup_reader.setblocking(True)
+
+   #----------------------------------------------------------------------
     def _connect(self) -> None:
         """
         Establish an SSL-wrapped socket connection.
 
         Ref: https://stackoverflow.com/a/23615951/70876
         """
-        # if self.running:
-        #     OBS.debug("Already connected to irc.")
-        #     return
-
         OBS.debug("Connecting to irc...")
         raw = socket.create_connection((self.HOST, self.PORT), timeout=60)
+
         ctx = ssl.create_default_context()
-        self.socket = ctx.wrap_socket(raw, server_hostname=self.HOST)
-        self.reader = self.socket.makefile(
-            "r",
-            encoding="utf-8",
-            newline="\r\n",
+        self.socket = ctx.wrap_socket(
+            raw,
+            server_hostname=self.HOST,
         )
-        #self.socket.settimeout(None)
+        self.socket.setblocking(True)
 
         # Ref: https://dev.twitch.tv/docs/chat/irc
         self._send_raw("CAP REQ :twitch.tv/tags twitch.tv/commands")
         self._send_raw(f"PASS oauth:{self.oauth}")
         self._send_raw(f"NICK {self.username}")
         self._send_raw(f"JOIN #{self.channel}")
+
         OBS.debug("connected.")
 
     #----------------------------------------------------------------------
     def _receive_loop(self) -> None:
         OBS.debug("Starting _receive_loop.")
+
         while self.running:
             try:
                 self._connect()
+                buffer = b""
+
                 while self.running:
-                    #OBS.debug("Reading line...")
-                    line = self.reader.readline()
-                    if not line:
-                        #continue
+                    readable, _, _ = select.select(
+                        [self.socket, self.wakeup_reader],
+                        [],
+                        [],
+                    )
+
+                    if self.wakeup_reader in readable:
+                        self.wakeup_reader.recv(1)
+                        break
+
+                    if self.socket not in readable:
+                        continue
+
+                    data = self.socket.recv(4096)
+
+                    if not data:
                         raise ConnectionError("EOF")
 
-                    #OBS.debug(f"Handling line: {line}")
-                    self._handle_line(line.rstrip())
+                    buffer += data
+
+                    while b"\r\n" in buffer:
+                        raw_line, buffer = buffer.split(b"\r\n", 1)
+                        line = raw_line.decode("utf-8", errors="replace")
+                        self._handle_line(line)
 
             except ConnectionError:
                 pass
 
             except Exception as ex:
                 OBS.warn(f"Twitch IRC Listener: {ex!r}")
+
                 try:
                     if self.socket:
                         OBS.debug("Closing socket.")
@@ -2018,8 +2081,20 @@ class TwitchIRCClient:
                 except Exception as e:
                     OBS.debug(f"Failed to close socket: {e!r}")
 
-                OBS.debug(f"Sleeping for {self.RECONNECT_DELAY} secs.")
-                time.sleep(self.RECONNECT_DELAY)
+                if self.running:
+                    OBS.debug(
+                        f"Sleeping for {self.RECONNECT_DELAY} secs."
+                    )
+                    time.sleep(self.RECONNECT_DELAY)
+
+            finally:
+                if self.socket:
+                    try:
+                        self.socket.close()
+                    except OSError:
+                        pass
+
+                self.socket = None
 
     #----------------------------------------------------------------------
     def _handle_line(self, line: str) -> None:
@@ -2046,26 +2121,39 @@ class TwitchIRCClient:
 
     #----------------------------------------------------------------------
     def _parse_privmsg(self, line: str) -> ChatMessage | None:
+        if not line:
+            return None
+
         try:
             tags_raw, remainder = line.split(" ", 1)
-            tags = self._parse_tags(tags_raw[1:])
-            prefix, _command, _channel, message = (
-                remainder.split(" ", 3)
-            )
-            username = prefix[1:].split("!")[0]
-            message = message[1:]
-
-            return ChatMessage(
-                username,
-                tags.get("display-name", username),
-                message,
-                (tags.get("mod") == "1"), # is_mod
-                ("broadcaster/1" in tags.get("badges", "")), # is_broadcaster
-            )
-
-        except Exception as e:
-            OBS.debug(e)
+            prefix, command, channel, message = remainder.split(" ", 3)
+        except ValueError:
             return None
+
+        if not tags_raw.startswith("@"):
+            return None
+
+        if command != "PRIVMSG":
+            return None
+
+        if not prefix.startswith(":"):
+            return None
+
+        if not message.startswith(":"):
+            return None
+
+        tags = self._parse_tags(tags_raw[1:])
+        username = prefix[1:].split("!", 1)[0]
+        if not username:
+            return None
+
+        return ChatMessage(
+            username,
+            tags.get("display-name", username),
+            message[1:],
+            tags.get("mod") == "1",
+            "broadcaster/1" in tags.get("badges", ""),
+        )
 
     #----------------------------------------------------------------------
     def _send_raw(self, line: str) -> None:
@@ -2077,7 +2165,6 @@ class TwitchIRCClient:
     @staticmethod
     def _parse_tags(raw: str) -> Dict[str, str]:
         result = {}
-
         for field in raw.split(";"):
             if "=" in field:
                 k, v = field.split("=", 1)
@@ -2154,7 +2241,7 @@ class GuessManager:
 
         self.guesses: Dict[str, int] = {}
 
-        self.winner: Optional[str] = None
+        self._winner: Optional[str] = None
         self.actual_secs: Optional[int] = None
 
     #----------------------------------------------------------------------
@@ -2171,23 +2258,25 @@ class GuessManager:
 
         self.guesses = {}
 
-        self.winner = None
+        self._winner = None
         self.actual_secs = None
 
     #----------------------------------------------------------------------
     def has_guess(self, username: str) -> int | False:
-        return self.guesses[username] if username in self.guesses.keys() else False
+        if username in self.guesses:
+            return self.guesses[username]
+
+        return False
 
     #----------------------------------------------------------------------
     def add_guess(self, username: str, seconds: int) -> bool:
         if not self.active:
             return False # Can't guess when brb isn't running.
 
-        if self.has_guess(username):
+        if self.has_guess(username) is not False:
             return False # User already has a guess registered.
 
         self.guesses[username] = seconds
-
         return True # Guess added.
 
     #----------------------------------------------------------------------
@@ -2204,6 +2293,9 @@ class GuessManager:
         Returns the paused time after .end() has been called but before
         .clear() has been called.
         """
+        if self.start_time is None:
+            return None
+
         if self.active:
             # Finish time is ongoing.
             finish_time = DT.now()
@@ -2213,8 +2305,8 @@ class GuessManager:
         else:
             return None
 
-        delta_secs = int(finish_time.timestamp() - self.start_time)
-        elapsed = DT.secs_to_delta(delta_secs)
+        #OBS.debug(locals())
+        elapsed = finish_time - self.start_time
 
         return elapsed
 
@@ -2245,7 +2337,7 @@ class GuessManager:
         self.auto_hide_time = self.stop_time + DT.secs_to_delta(auto_hide_secs)
 
     #----------------------------------------------------------------------
-    def winner(self) -> tuple[str, int]:
+    def winner(self) -> tuple[str, int] | tuple[False, None]:
         """
         Returns false if no !brb has run, or is still running, or if
         nobody registered any guesses.
@@ -2254,13 +2346,18 @@ class GuessManager:
         present.
         """
         if self.active:
-            return False # No winner when brb is still active.
+            return (False, None) # No winner when brb is still active.
 
         if len(self.guesses) == 0:
-            return False # Nobody guessed, so there's no winner.
+            return (False, None) # Nobody guessed, so there's no winner.
 
-        username = self._qualified.keys()[-1]
-        guessed_secs = self.guesses[username]
+        qualified = self._qualified()
+
+        if not qualified:
+            return (False, None)
+
+        username, guessed_secs = next(reversed(qualified.items()))
+
         return (username, guessed_secs)
 
     #----------------------------------------------------------------------
@@ -2282,18 +2379,25 @@ class GuessManager:
 
     #----------------------------------------------------------------------
     def _qualified(self) -> Dict[str, int]:
+        if self.actual_secs is None:
+            return {}
+
         # Exclude any guess larger than the actual seconds.
-        qualified = dict(filter(
-            lambda secs: secs <= self.actual_secs,
-            self.guesses.items(),
-        ))
+        qualified = {
+            username: seconds
+            for username, seconds in self.guesses.items()
+            if seconds <= self.actual_secs
+        }
 
-        # Sort the remaining guesses by number of seconds.
-        qualified = dict(sorted(qualified.items(), key=lambda secs: secs))
-
-        # The largest (last) guess is the one closest to actual_secs
+        # Sort the remaining guesses by number of seconds. The
+        # largest (last) guess is the one closest to actual_secs
         # without going over.
-        return qualified
+        return dict(
+            sorted(
+                qualified.items(),
+                key=lambda item: item[1],
+            )
+        )
 
 
 ###########################################################################
@@ -2367,8 +2471,9 @@ class TimerRenderer:
             with OBS.scene_current() as scene:
                 with OBS.sceneitem_by_name(self.text_source_name, scene) as si:
                     OBS.sceneitem_set_visible(si, visibility)
-        except:
-            OBS.error("Failed to set sceneitem visibility.")
+        except Exception as exc:
+            OBS.error(f"Failed to set sceneitem visibility: {exc!r}")
+
 
 
 ###########################################################################
@@ -2425,7 +2530,7 @@ class BRBSettings(object):
     #----------------------------------------------------------------------
     def to_data(
             self,
-            existing = None, # obs_data_t
+            existing, # = None, # obs_data_t
         ): # -> obs_data_t
         """
         Dump all local BRBSettings attributes to the provided obs_data_t
@@ -2435,7 +2540,7 @@ class BRBSettings(object):
             value = getattr(self, name)
             #OBS.debug(f"Setting {name} = {value}")
             OBS.data_set(
-                existing if existing is not None else self.__obs_data,
+                existing, # if existing is not None else self.__obs_data,
                 name,
                 value,
             )
@@ -2487,21 +2592,6 @@ class BRBScript:
     Ref: https://obsproject.com/kb/scripting-guide#script-lifecycle
     """
 
-    settings: BRBSettings = BRBSettings()
-    twitch: TwitchOAuth = TwitchOAuth(settings)
-    guesses: GuessManager = GuessManager()
-    renderer: Optional[TimerRenderer] = None
-
-    # This is initialized on an as-needed basis.
-    irc: Optional[TwitchIRCClient] = None
-
-    # Flipped on when on_obs_ready() completes successfully.
-    frontend_ready: bool = False
-
-    # Store registered event handlers.
-    # Ensures a previously-unaccessed dict key starts out as an empty list.
-    events = defaultdict(list)
-
     # ---------------------------------------------------------------------
     # Data Management
     # ---------------------------------------------------------------------
@@ -2509,21 +2599,32 @@ class BRBScript:
     #----------------------------------------------------------------------
     def __init__(self, obs_module):
         self.obs = obs_module
+        self.reset()
 
     #----------------------------------------------------------------------
     def reset(
-            self,
-            settings = None, # obs_data_t
-        ) -> None:
-        self.settings = BRBSettings()
+        self,
+        settings = None, # obs_data_t
+    ) -> None:
+        self.settings: BRBSettings = BRBSettings()
         if settings:
             self.settings.from_data(settings)
 
-        self.twitch = TwitchOAuth(self.settings)
-        self.guesses = GuessManager()
-        self.renderer = None # Gets created when streaming starts.
+        self.twitch: TwitchOAuth = TwitchOAuth(self.settings)
+        self.guesses: GuessManager = GuessManager()
+        self.renderer: Optional[TimerRenderer] = None # Gets created when streaming starts.
 
+        # This is initialized on an as-needed basis.
+        self.irc: Optional[TwitchIRCClient] = None
+
+        # Flipped on when on_obs_ready() completes successfully.
+        self.frontend_ready: bool = False
+
+        # Store registered event handlers.
+        # Ensures a previously-unaccessed dict key starts out as an empty list.
         self.events = defaultdict(list)
+
+        self.send_lock = threading.Lock()
 
     #----------------------------------------------------------------------
     def settings_merge(
@@ -2540,6 +2641,102 @@ class BRBScript:
         """
         self.settings.from_data(new_settings)
         self.settings.to_data(new_settings) # new_settings is modified by this call.
+
+
+    # ---------------------------------------------------------------------
+    # State Introspection
+    # ---------------------------------------------------------------------
+
+    #----------------------------------------------------------------------
+    def is_frontend_ready(self) -> bool:
+        return self.frontend_ready
+
+    #----------------------------------------------------------------------
+    def is_source_exists(self) -> bool:
+        return self.is_frontend_ready() and OBS.source_exists(SOURCES.TEXT_TIMER)
+
+    #----------------------------------------------------------------------
+    def is_renderer_initialized(self) -> bool:
+        return self.renderer is not None
+
+    #----------------------------------------------------------------------
+    def is_renderer_visible(self) -> bool:
+        return self.is_renderer_initialized() and self.renderer.visible()
+
+    #----------------------------------------------------------------------
+    def is_guessing_initialized(self) -> bool:
+        return self.guesses is not None
+
+    #----------------------------------------------------------------------
+    def is_guessing_running(self) -> bool:
+        return self.is_guessing_initialized() and self.guesses.running()
+
+    #----------------------------------------------------------------------
+    def is_irc_initialized(self) -> bool:
+        return self.irc is not None
+
+    #----------------------------------------------------------------------
+    def is_irc_running(self) -> bool:
+        return self.is_irc_initialized() and self.irc.running
+
+    #----------------------------------------------------------------------
+    def is_irc_connected(self) -> bool:
+        return self.is_irc_running() and self.irc.thread.is_alive()
+        # TODO: Should also check for socket connection. Ref: https://stackoverflow.com/a/62277798/70876
+
+    #----------------------------------------------------------------------
+    def is_twitch_initialized(self) -> bool:
+        return self.twitch is not None
+
+    #----------------------------------------------------------------------
+    def is_twitch_present(self) -> bool:
+        return self.is_twitch_initialized() and self.twitch.creds_present()
+
+    #----------------------------------------------------------------------
+    def is_twitch_valid(self) -> bool:
+        return self.is_twitch_present() and not self.twitch.creds_expired()
+
+    #----------------------------------------------------------------------
+    def is_twitch_populated(self) -> bool:
+        return (
+            self.is_twitch_valid()
+            and self.twitch.user_present()
+            and self.twitch.channel_present()
+        )
+
+    #----------------------------------------------------------------------
+    def is_timer_ticking(self) -> bool:
+        return OBS.timer_running(self.on_timer)
+
+
+    # ---------------------------------------------------------------------
+    # State Mutation
+    # ---------------------------------------------------------------------
+
+    #----------------------------------------------------------------------
+    def update_prop_visibility(
+        self,
+        props, # obs_properties_t
+    ) -> bool:
+        all = {
+            # widget_name: boolean to show or not
+            'twitch_connect_button': True,
+            'twitch_oauth_access_token': True,
+            'twitch_creds_expired': not self.is_twitch_valid(),
+            'auto_hide_secs': True,
+
+            'make_ready_button': not self.is_frontend_ready(),
+            'make_not_ready_button': self.is_frontend_ready(),
+            'create_source_button': not self.is_source_exists(),
+            'irc_start_button': not self.is_irc_connected(),
+            'irc_stop_button': self.is_irc_connected(),
+            'guess_start_button': not self.is_guessing_running(),
+            'guess_stop_button': self.is_guessing_running(),
+            'timer_start_button': not self.is_timer_ticking(),
+            'timer_stop_button': self.is_timer_ticking(),
+        }
+        OBS.properties_visibility_set(props, all)
+        return True
 
     #----------------------------------------------------------------------
     def update_twitch(self, changes: Dict[str, any] = None) -> bool:
@@ -2644,7 +2841,7 @@ class BRBScript:
         self,
         obs_const: int, # OBS_FRONTEND_EVENT_*
         callback: ObsEventCallback,
-    ) -> bool:
+    ) -> None:
         """
         Register a callback for a specific OBS event.
 
@@ -2662,22 +2859,19 @@ class BRBScript:
         Handles a sucessful !brb chat command by registering an OBS
         "timer" that fires once every second to update the on-screen
         text source's display count-up time.
-
-        OBS docs specifically warns againt using a python instance method
-        as a timer, so we use a global variable to store the callback.
-
-        Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5/README.md?plain=1#L472
         """
-        self.event_stop_ticking()
-
-        ticker_lock = False
-
-        if ticker_lock: # TODO: Need to ensure we don't start duplicate timers.
+        self.event_stop_ticking() # Clear any existing timer.
+        try:
             OBS.timer_add(self.on_timer, 1 * 1000) # ms
+        except ValueError:
+            OBS.warn('Tried to start timer but it was already running.')
 
     #----------------------------------------------------------------------
     def event_stop_ticking(self) -> None:
-        OBS.timer_remove(self.on_timer)
+        try:
+            OBS.timer_remove(self.on_timer, True)
+        except ValueError:
+            OBS.warn("Tried to remove timer but it wasn't running.")
 
 
     # ---------------------------------------------------------------------
@@ -2696,13 +2890,6 @@ class BRBScript:
         """
         factory = OBSPropsFactory(obs, OBS.properties_create())
 
-        # Currently disabled in favor of auto-create when streaming starts.
-        # factory.button(
-        #     "create_source",
-        #     "Create Text Source",
-        #     self.on_create_source,
-        # )
-
         factory.twitch_button(
             'connect', #  -> button id = `twitch_connect_button`. No callback because URL is present (but would be `BRBScript.on_twitch_connect`.)
             TwitchOAuth.kickoff_url(),
@@ -2712,23 +2899,6 @@ class BRBScript:
                 'a Twitch API token for this script to use. '
                 'Paste it below.'
             ),
-            (not script.twitch.creds_present()),
-        )
-
-        factory.twitch_button(
-            'reconnect', # -> no callback because URL is present. (but would be `BRBScript.on_twitch_reconnect`)
-            TwitchOAuth.kickoff_url(),
-            self.obs.OBS_TEXT_INFO_WARNING,
-            'Twitch token has expired. Please obtain a fresh token.',
-            script.twitch.creds_present() and script.twitch.creds_expired(),
-        )
-
-        factory.twitch_button(
-            'disconnect', # -> BRBScript.on_twitch_disconnect
-            None,
-            self.obs.OBS_TEXT_INFO_ERROR,
-            'Remove stored Twitch credentials.',
-            script.twitch.creds_present() and not script.twitch.creds_expired(),
         )
 
         factory.text(
@@ -2738,17 +2908,11 @@ class BRBScript:
             self.on_twitch_oauth_access_token
         )
 
-        # TODO: If irc client is running, show a button to restart it?
-        # factory.button(
-        #     'irc_start',
-        #     'Start IRC Client',
-        #     script.on_irc_start
-        # )
-        # factory.button(
-        #     'irc_stop',
-        #     'Stop IRC Client',
-        #     script.on_irc_stop
-        # )
+        #     factory.text_info( # TODO text_info() doesn't exist yet
+        #         'twitch_creds_expired',
+        #         'Twitch token has expired. Please obtain a fresh token.',
+        #         self.obs.OBS_TEXT_INFO_WARNING,
+        #     )
 
         factory.int_with_unit(
             "auto_hide_secs",
@@ -2757,7 +2921,7 @@ class BRBScript:
             60 * 30, # max (30 mins)
             1,       # step
             " secs", # unit
-            script.on_auto_hide_secs
+            self.on_auto_hide_secs
         )
 
         return factory.props
@@ -2840,13 +3004,15 @@ class BRBScript:
         #OBS.debug(f"changed settings: {OBS.data_get_json(changed_settings)}")
         incoming = OBS.data_get_all(changed_settings)
 
-        script.update_twitch(incoming)
+        self.update_twitch(incoming)
         #OBS.debug(f"BRBSettings after update_twitch: {self.settings!s}")
 
         # Write our tweaked settings values back to the provided
         # `settings` obs_data_t object for OBS to persist for us.
-        script.settings.to_data(changed_settings)
+        self.settings.to_data(changed_settings)
         #OBS.debug(f"changed settings after update_twitch: {OBS.data_get_json(changed_settings)}")
+
+        return True
 
     #----------------------------------------------------------------------
     # ✅
@@ -2855,8 +3021,10 @@ class BRBScript:
         props = None, # obs_properties_t
         prop = None, # obs_property_t
     ) -> bool:
-        if prop is None:
-            source = SOURCES.TEXT_TIMER
+        # if prop is not None:
+        #     source = self.settings.source_name
+        # else:
+        source = SOURCES.TEXT_TIMER
 
         if not self.frontend_ready:
             OBS.warn("OBS frontend is not yet ready. Can't create text source.")
@@ -2867,6 +3035,7 @@ class BRBScript:
             return True
 
         generator = SourceGenerator(
+            OBS,
             source_name = source,
             text = DEFAULTS.TIMER_TEXT,
         )
@@ -2939,7 +3108,7 @@ class BRBScript:
         Shutdown the background IRC client thread and reset script state.
         """
         # Stop guesses immediately.
-        self.guesses.end(5)
+        self.guesses.end(0)
 
         # Hide the on-screen timer.
         self.event_stop_ticking()
@@ -2947,7 +3116,7 @@ class BRBScript:
         #     self.renderer.hide()
 
         # Shut down the IRC client.
-        if self.irc is not None and self.irc.running:
+        if self.is_irc_running():
             self.irc.stop()
 
     #----------------------------------------------------------------------
@@ -2994,7 +3163,8 @@ class BRBScript:
         settings, # obs_data_t
     ) -> bool:
         self.settings.auto_hide_secs = int(OBS.data_get(settings, 'auto_hide_secs'))
-        return False
+        #self.update_prop_visibility(props)
+        return False # GUI is already up to date.
 
     #----------------------------------------------------------------------
     def on_chat(self, message: ChatMessage) -> None:
@@ -3049,8 +3219,8 @@ class BRBScript:
         self.guesses.start()
 
         # # Schedule 1 second timer updates.
-        # OBS.debug("Starting on-screen ticker.")
-        # self.event_start_ticking()
+        OBS.debug("Starting on-screen ticker.")
+        self.event_start_ticking()
 
         # # Show the on-screen timer.
         # OBS.debug("Enabling on-screen timer visibility.")
@@ -3093,7 +3263,7 @@ class BRBScript:
             ))
             return
 
-        if self.guesses.add_guess(msg.username, parsed_delta.total_seconds):
+        if self.guesses.add_guess(msg.username, parsed_delta.total_seconds()):
             OBS.debug(f"Guess registered for user {msg.username}: {parsed_delta}")
             self.irc.send_chat(str.format(
                 MESSAGES.GUESS_ACCEPTED,
@@ -3126,7 +3296,7 @@ class BRBScript:
         self.guesses.end(self.settings.auto_hide_secs)
 
         # Announce the winner.
-        (winner, *guess_secs) = self.guesses.winner()
+        (winner, guess_secs) = self.guesses.winner()
         if winner:
             OBS.debug(f"!brb winner is: {winner}")
             self.irc.send_chat(str.format(
@@ -3187,7 +3357,7 @@ def script_description() -> str:
     cell_style = 'style="background-color: #444444;"'
 
     return dedent(f"""
-        <h3><a href="https://github.com/beporter/brb-timer">BRB Timer</a></h3>
+        <h3><a href="https://github.com/beporter/brb-timer">{SCRIPT_NAME}</a> v{SCRIPT_VERSION}</h3>
 
         <p>Let chatters guess when the streamer will return from being AFK.<br></p>
 
@@ -3302,7 +3472,7 @@ def script_unload() -> None:
 # Global Script Instance
 ###########################################################################
 
-script = None
+script = None # Must always exist in module/global namespace.
 
 def main():
     global script
@@ -3310,6 +3480,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
