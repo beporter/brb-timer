@@ -203,43 +203,5 @@ class TestScript(unittest.TestCase):
             f"{brb_timer.SCRIPT_NAME} unloaded."
         )
 
-    def test_main(self):
-        """
-        main() should create exactly one BRBScript using the module's
-        OBS module and store it in the module-global `script`.
-        """
-        old_script = brb_timer.script
-
-        with patch("brb_timer.BRBScript") as BRBScript:
-            instance = BRBScript.return_value
-
-            result = brb_timer.main()
-
-        self.assertIsNone(result)
-
-        BRBScript.assert_called_once_with(brb_timer.obs)
-        self.assertIs(brb_timer.script, instance)
-
-        # Restore the global immediately as an additional guard in case
-        # this test is run independently.
-        brb_timer.script = old_script
-
-    def test_main_replaces_existing_script(self):
-        """
-        Calling main() again should replace the existing global
-        instance rather than reusing it.
-        """
-        existing = MagicMock()
-        brb_timer.script = existing
-
-        with patch("brb_timer.BRBScript") as BRBScript:
-            replacement = BRBScript.return_value
-
-            brb_timer.main()
-
-        self.assertIs(brb_timer.script, replacement)
-        self.assertIsNot(brb_timer.script, existing)
-        BRBScript.assert_called_once_with(brb_timer.obs)
-
 if __name__ == '__main__':
     unittest.main()

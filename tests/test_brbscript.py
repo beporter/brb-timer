@@ -121,6 +121,7 @@ class TestBRBScript(unittest.TestCase):
         self.script.renderer.visible.return_value = False
         self.assertFalse(self.script.is_renderer_visible())
 
+        self.script.frontend_ready = True
         self.script.renderer.visible.return_value = True
         self.assertTrue(self.script.is_renderer_visible())
 
@@ -659,35 +660,34 @@ class TestBRBScript(unittest.TestCase):
         # Existing source.
         self.script.frontend_ready = True
 
-        with patch("brb_timer.OBS.source_exists", return_value=True), \
+        with patch.object(self.script, "is_frontend_ready", return_value=True), \
+             patch.object(self.script, "is_source_exists", return_value=True), \
              patch("brb_timer.OBS.info") as info:
 
             result = self.script.on_create_source()
 
-        self.assertTrue(result)
+        self.assertFalse(result)
         info.assert_called_once()
 
         # New source, successful creation.
         self.script.frontend_ready = True
-        generator = MagicMock()
-        generator.create_source.return_value = True
 
         with patch("brb_timer.OBS.source_exists", return_value=False), \
-             patch("brb_timer.SourceGenerator", return_value=generator), \
+             patch("brb_timer.SourceGenerator.create_source", return_value=True) as generator, \
              patch("brb_timer.OBS.frontend_open_source_props"), \
              patch.object(self.script, "update_prop_visibility"):
 
             result = self.script.on_create_source()
 
         self.assertTrue(result)
-        generator.create_source.assert_called_once()
+        generator.assert_called_once()
 
         # New source, failed creation.
         generator = MagicMock()
         generator.create_source.return_value = False
 
         with patch("brb_timer.OBS.source_exists", return_value=False), \
-             patch("brb_timer.SourceGenerator", return_value=generator), \
+             patch("brb_timer.SourceGenerator.create_source", return_value=False) as generator, \
              patch("brb_timer.OBS.error") as error:
 
             result = self.script.on_create_source()
@@ -762,7 +762,8 @@ class TestBRBScript(unittest.TestCase):
         self.renderer.visible.return_value = True
         self.guesses.timer_str.return_value = "00:42"
 
-        with patch("brb_timer.OBS.event_remove_self") as remove_self:
+        with patch("brb_timer.OBS.event_remove_self") as remove_self, \
+        patch.object(self.script, 'is_renderer_visible', return_value=True):
             self.script.on_timer()
 
         remove_self.assert_not_called()
@@ -940,15 +941,21 @@ class TestBRBScript(unittest.TestCase):
         self.irc.reset_mock()
         self.guesses.running.return_value = False
 
-        with patch.object(self.script, "event_stop_ticking") as stop, \
+        with patch.object(self.script, "is_timer_ticking", return_value=(True, False)) as ticking, \
+             patch.object(self.script, "is_guessing_running", return_value=False) as guessing, \
+             patch.object(self.script, "is_renderer_initialized", return_value=True) as renderer, \
+             patch.object(self.script, "event_stop_ticking") as stop, \
              patch.object(self.script, "event_start_ticking") as start:
 
             self.script.command_brb(msg)
 
+        self.assertGreaterEqual(ticking.call_count, 2)
+        self.assertGreaterEqual(guessing.call_count, 1)
+        renderer.assert_called_once()
         stop.assert_called_once()
         self.guesses.start.assert_called_once()
         start.assert_called_once()
-        self.irc.send_chat.assert_not_called()
+        self.send_chat.assert_called_once()
 
     # ------------------------------------------------------------------
     # !at

@@ -27,11 +27,22 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-logging.basicConfig(level=logging.DEBUG)
+#logging.basicConfig(level=logging.DEBUG)
 # http_client.HTTPConnection.debuglevel = 1
 # requests_log = logging.getLogger("requests.packages.urllib3")
 # requests_log.setLevel(logging.DEBUG)
 # requests_log.propagate = True
+
+LOG_FILE = '/Users/beporter/Library/Application Support/obs-studio/brb-timer.log'
+logging.basicConfig(filename=LOG_FILE,
+                    filemode='a',
+                    format='%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S',
+                    level=logging.DEBUG)
+
+# logging.info("Running Urban Planning")
+logger = logging.getLogger('brbtimer')
+logger.propagate = True
 
 try:
     import obspython as obs # type: ignore
@@ -393,24 +404,16 @@ class OBS:
         Returns True if a source with source_name is already present
         in the currently active scene.
 
-        Ref:
+        Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5/src/toggle_sceneitem_vis.py#L9-L13
         """
         with self.scene_current() as scene:
-            try:
-                if scene is None:
-                    raise ValueError('Scene not available.')
+            # `scene` will get released by scene_current's context manager.
+            if scene is None:
+                return False
 
-                sceneitem = obs.obs_scene_find_source(scene, source_name)
-                exists = (sceneitem is not None)
-
-            except ValueError:
-                exists = False
-
-            finally:
-                if exists:
-                    obs.obs_sceneitem_release(sceneitem)
-
-        return exists
+            # `sceneitem` does not need to be released.
+            sceneitem = obs.obs_scene_find_source(scene, source_name)
+            return (sceneitem is not None)
 
     #----------------------------------------------------------------------
     @classmethod
@@ -591,7 +594,10 @@ class OBS:
                 # do something with `scene`.
         """
         try:
+            # Must be released with obs_source_release()
             scene_source = obs.obs_frontend_get_current_scene()
+
+            # Does not need to be released!
             scene = obs.obs_scene_from_source(scene_source)
 
             yield scene
@@ -599,8 +605,6 @@ class OBS:
         finally:
             if scene_source is not None:
                 obs.obs_source_release(scene_source)
-            if scene is not None:
-                obs.obs_scene_release(scene)
 
 
     # ---------------------------------------------------------------------
@@ -2652,8 +2656,13 @@ class BRBScript:
         return self.frontend_ready
 
     #----------------------------------------------------------------------
-    def is_source_exists(self) -> bool:
-        return self.is_frontend_ready() and OBS.source_exists(SOURCES.TEXT_TIMER)
+    def is_source_exists(self, source_name: str = None) -> bool:
+        return (
+            self.is_frontend_ready()
+            and OBS.source_exists(
+                SOURCES.TEXT_TIMER if source_name is None else source_name,
+            )
+        )
 
     #----------------------------------------------------------------------
     def is_renderer_initialized(self) -> bool:
@@ -2793,12 +2802,12 @@ class BRBScript:
         Tell the renderer to target a different text source if the user
         changed it.
         """
-        if not self.frontend_ready:
+        if not self.is_frontend_ready():
             return False
 
         if (
             self.renderer is not None
-            and OBS.source_exists(source_name)
+            and self.is_source_exists(source_name)
         ):
             self.renderer.clear()
             self.renderer.set_source(source_name)
@@ -2973,7 +2982,7 @@ class BRBScript:
         self.frontend_ready = True
 
         # Create the text source if it doesn't already exist.
-        if not OBS.source_exists(SOURCES.TEXT_TIMER):
+        if not self.is_source_exists(SOURCES.TEXT_TIMER):
             OBS.debug(
                 "Creating on-screen timer text source "
                 f"named: {SOURCES.TEXT_TIMER}"
@@ -3026,11 +3035,11 @@ class BRBScript:
         # else:
         source = SOURCES.TEXT_TIMER
 
-        if not self.frontend_ready:
+        if not self.is_frontend_ready():
             OBS.warn("OBS frontend is not yet ready. Can't create text source.")
             return False
 
-        if OBS.source_exists(source):
+        if self.is_source_exists(source):
             OBS.info(f"Source already exists: {source}")
             return True
 
@@ -3094,7 +3103,8 @@ class BRBScript:
         OBS.debug('Timer triggered.')
         if self.guesses.should_hide():
             OBS.debug("should_hide is true- removing self")
-            self.renderer.hide()
+            if self.is_renderer_initialized():
+                self.renderer.hide()
             OBS.event_remove_self()
 
         timer_text = self.guesses.timer_str()
@@ -3472,11 +3482,10 @@ def script_unload() -> None:
 # Global Script Instance
 ###########################################################################
 
-script = None # Must always exist in module/global namespace.
-
-def main():
-    global script
-    script = BRBScript(obs)
+script = BRBScript(obs) # Must _always_ exist in module/global namespace.
 
 if __name__ == "__main__":
-    main()
+    sys.exit(
+        "This script can't be run directly. "
+        "Add it to OBS in the Tools > Scripts panel."
+    )

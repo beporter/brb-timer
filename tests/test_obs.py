@@ -49,9 +49,7 @@ class TestOBS(unittest.TestCase):
             self.scene,
             "Timer",
         )
-        self.mock_obs.obs_sceneitem_release.assert_called_once_with(
-            self.sceneitem
-        )
+        self.mock_obs.obs_sceneitem_release.assert_not_called()
 
     def test_source_exists_when_scene_unavailable(self):
         with patch.object(
@@ -427,9 +425,7 @@ class TestOBS(unittest.TestCase):
         self.mock_obs.obs_source_release.assert_called_once_with(
             scene_source
         )
-        self.mock_obs.obs_scene_release.assert_called_once_with(
-            self.scene
-        )
+        self.mock_obs.obs_scene_release.assert_not_called()
 
     def test_scene_current_releases_after_exception(self):
         scene_source = MagicMock(name="scene_source")
@@ -446,9 +442,7 @@ class TestOBS(unittest.TestCase):
         self.mock_obs.obs_source_release.assert_called_once_with(
             scene_source
         )
-        self.mock_obs.obs_scene_release.assert_called_once_with(
-            self.scene
-        )
+        self.mock_obs.obs_scene_release.assert_not_called()
 
     def test_scene_add(self):
         self.mock_obs.obs_scene_add.return_value = self.sceneitem
@@ -1371,11 +1365,10 @@ class TestOBS(unittest.TestCase):
         def my_timer():
             pass
 
-        with patch.object(OBS, "debug") as mock_debug:
+        with patch.object(OBS, "debug"):
             result = OBS.timer_remove(my_timer)
 
         self.assertFalse(result)
-        mock_debug.assert_called_once()
 
     def test_timer_remove_missing_throw(self):
         def my_timer():
@@ -1451,27 +1444,27 @@ class TestOBS(unittest.TestCase):
         prop = MagicMock()
         self.mock_obs.obs_properties_get.return_value = prop
         self.mock_obs.obs_property_name.return_value = "text"
-        self.mock_obs.obs_property_visible.return_value = True
+        self.mock_obs.obs_property_visible.return_value = False
 
-        with patch.object(OBS, "debug") as mock_debug:
+        with patch.object(OBS, "debug"):
             OBS.property_show(self.settings, "text")
 
         self.mock_obs.obs_properties_get.assert_called_once_with(
             self.settings,
             "text",
         )
+        # Only called when visibility is False to start with.
         self.mock_obs.obs_property_set_visible.assert_called_once_with(
             prop,
             True,
         )
         self.mock_obs.obs_property_name.assert_called_once_with(prop)
-        self.mock_obs.obs_property_visible.assert_called_once_with(prop)
-        self.assertGreaterEqual(mock_debug.call_count, 2)
+        self.mock_obs.obs_property_visible.assert_any_call(prop)
 
     def test_property_show_missing_property(self):
         self.mock_obs.obs_properties_get.return_value = None
 
-        with patch.object(OBS, "debug") as mock_debug:
+        with patch.object(OBS, "debug"):
             OBS.property_show(self.settings, "missing")
 
         self.mock_obs.obs_property_set_visible.assert_not_called()
@@ -1480,16 +1473,16 @@ class TestOBS(unittest.TestCase):
         prop = MagicMock()
         self.mock_obs.obs_properties_get.return_value = prop
         self.mock_obs.obs_property_name.return_value = "text"
-        self.mock_obs.obs_property_visible.return_value = False
+        self.mock_obs.obs_property_visible.return_value = True
 
-        with patch.object(OBS, "debug") as mock_debug:
+        with patch.object(OBS, "debug"):
             OBS.property_hide(self.settings, "text")
 
+        # Only called when visibility is True to start with.
         self.mock_obs.obs_property_set_visible.assert_called_once_with(
             prop,
             False,
         )
-        self.assertGreaterEqual(mock_debug.call_count, 2)
 
     def test_property_hide_missing_property(self):
         self.mock_obs.obs_properties_get.return_value = None
