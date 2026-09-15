@@ -24,20 +24,14 @@ class TestTimerRenderer(unittest.TestCase):
 
     @patch("brb_timer.OBS")
     def test_set_text(self, mock_obs):
-        source = MagicMock()
-
-        # OBS.source_by_name(...) is used as a context manager.
-        mock_obs.source_by_name.return_value.__enter__.return_value = source
+        self.renderer.set_source('BRB Timer') # TODO: Convert to using SCRIPT_NAME const.
+        mock_obs.source_set_text.return_value = True
 
         result = self.renderer.set_text("01:23")
 
         self.assertTrue(result)
 
-        mock_obs.source_by_name.assert_called_once_with(self.source_name)
-        mock_obs.source_update.assert_called_once_with(
-            source,
-            {"text": "01:23"},
-        )
+        mock_obs.source_set_text.assert_called_once_with(self.source_name, "01:23")
 
     @patch("brb_timer.OBS")
     def test_set_text_without_source_name(self, mock_obs):
@@ -52,14 +46,13 @@ class TestTimerRenderer(unittest.TestCase):
 
     @patch("brb_timer.OBS")
     def test_set_text_source_not_found(self, mock_obs):
-        mock_obs.source_by_name.return_value.__enter__.return_value = None
+        mock_obs.source_set_text.return_value = False
 
         result = self.renderer.set_text("01:23")
 
         self.assertFalse(result)
 
-        mock_obs.source_by_name.assert_called_once_with(self.source_name)
-        mock_obs.error.assert_called_once()
+        mock_obs.source_set_text.assert_called_once_with(self.source_name, "01:23")
         mock_obs.source_update.assert_not_called()
 
     @patch("brb_timer.OBS")
@@ -73,74 +66,22 @@ class TestTimerRenderer(unittest.TestCase):
         mock_hide.assert_called_once_with()
 
     def test_show(self):
-        with patch.object(
-            self.renderer,
-            "_set_visibility",
+        with patch(
+            "brb_timer.OBS.sceneitem_set_visible_by_name",
         ) as mock_set_visibility:
 
             self.renderer.show()
 
-        mock_set_visibility.assert_called_once_with(True)
+        mock_set_visibility.assert_called_once_with('BRB Timer', True)
 
     def test_hide(self):
-        with patch.object(
-            self.renderer,
-            "_set_visibility",
+        with patch(
+            "brb_timer.OBS.sceneitem_set_visible_by_name",
         ) as mock_set_visibility:
 
             self.renderer.hide()
 
-        mock_set_visibility.assert_called_once_with(False)
-
-    @patch("brb_timer.OBS")
-    def test_set_visibility(self, mock_obs):
-        scene = MagicMock()
-        sceneitem = MagicMock()
-
-        # Configure both OBS context managers.
-        mock_obs.scene_current.return_value.__enter__.return_value = scene
-        mock_obs.sceneitem_by_name.return_value.__enter__.return_value = sceneitem
-
-        self.renderer._set_visibility(True)
-
-        mock_obs.scene_current.assert_called_once_with()
-        mock_obs.sceneitem_by_name.assert_called_once_with(
-            self.source_name,
-            scene,
-        )
-        mock_obs.sceneitem_set_visible.assert_called_once_with(
-            sceneitem,
-            True,
-        )
-        mock_obs.error.assert_not_called()
-
-    @patch("brb_timer.OBS")
-    def test_set_visibility_false(self, mock_obs):
-        scene = MagicMock()
-        sceneitem = MagicMock()
-
-        mock_obs.scene_current.return_value.__enter__.return_value = scene
-        mock_obs.sceneitem_by_name.return_value.__enter__.return_value = sceneitem
-
-        self.renderer._set_visibility(False)
-
-        mock_obs.sceneitem_set_visible.assert_called_once_with(
-            sceneitem,
-            False,
-        )
-
-    @patch("brb_timer.OBS")
-    def test_set_visibility_handles_exception(self, mock_obs):
-        mock_obs.scene_current.side_effect = RuntimeError(
-            "OBS connection failed"
-        )
-
-        # _set_visibility() catches the exception and should not propagate it.
-        self.renderer._set_visibility(True)
-
-        mock_obs.error.assert_called_once_with(
-            "Failed to set sceneitem visibility: RuntimeError('OBS connection failed')"
-        )
+        mock_set_visibility.assert_called_once_with('BRB Timer', False)
 
 if __name__ == '__main__':
     unittest.main()

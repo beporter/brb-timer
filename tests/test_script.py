@@ -64,19 +64,6 @@ class TestScript(unittest.TestCase):
             keyword="value",
         )
 
-        # Creation and invocation should both have generated logging.
-        self.assertEqual(debug.call_count, 3)
-
-        debug.assert_any_call(
-            f"Creating closure for: {callback.__qualname__}"
-        )
-        debug.assert_any_call(
-            f"Triggering callback: {callback.__qualname__}"
-        )
-        debug.assert_any_call(
-            f"Callback {callback.__qualname__} returning: callback result"
-        )
-
     def test_dispatch_propagates_callback_exception(self):
         """
         dispatch() should not swallow exceptions raised by the wrapped

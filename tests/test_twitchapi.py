@@ -357,7 +357,7 @@ class TestTwitchApi(unittest.TestCase):
             side_effect=error,
         ), patch(
             'brb_timer.json.load',
-            side_effect=Exception('invalid response body'),
+            side_effect=json.JSONDecodeError('invalid response body', 'http body', 100),
         ), patch(
             'brb_timer.OBS.error',
         ) as mock_error:
@@ -365,7 +365,7 @@ class TestTwitchApi(unittest.TestCase):
             result = self.api._get('helix/test')
 
         self.assertFalse(result)
-        mock_error.assert_called_once_with('unauthorized')
+        mock_error.assert_called_once_with('Unauthorized. (Invalid JSON payload.)')
 
     def test_get_rate_limited(self):
         headers = {
