@@ -2,14 +2,351 @@
 Minimal implementation of BRB Timer, starting from working timer example in simple.py.
 """
 import obspython as S
+from dataclasses import dataclass
 import datetime
 import inspect
+import select
+import socket
+import ssl
 import sys
+import threading
 import time
-from typing import Callable
+from typing import Callable, Dict
+
+
+SCRIPT_NAME = "BRB Timer"
+SCRIPT_VERSION = 1.0
+
+
+###########################################################################
+# Twitch IRC Client
+
+@dataclass
+class ChatMessage(object):
+    """
+    Message passing container from the IRC client to the command parser.
+    """
+    username: str
+    display_name: str
+    message: str
+    is_mod: bool
+    is_broadcaster: bool
+
+type IrcMsgCallback = Callable[[ChatMessage], None]
+
+class TwitchIRCClient:
+    HOST = "irc.chat.twitch.tv"
+    PORT = 6697
+    RECONNECT_DELAY = 5
+
+    #----------------------------------------------------------------------
+    def __init__(
+        self,
+        channel: str,
+        username: str,
+        oauth: str,
+        callback: IrcMsgCallback,
+    ):
+        self.channel = channel.lower().lstrip("#")
+        self.username = username
+        self.oauth = oauth.removeprefix("oauth:")
+        self.callback = callback
+
+        self.socket = None
+        self.send_lock = threading.Lock()
+        self.running = False
+        self.thread = None
+
+    #----------------------------------------------------------------------
+    def start(self) -> None:
+        if self.running:
+            return
+
+        self._create_wakeup_pair()
+        self._drain_wakeup()
+
+        self.running = True
+        self.thread = threading.Thread(
+            target=self._receive_loop,
+            daemon=True,
+            name=f"{SCRIPT_NAME}-TwitchIRC",
+        )
+        self.thread.start()
+
+    #----------------------------------------------------------------------
+    def close(self) -> None:
+        """
+        Permanently close the client.
+
+        The receiver thread owns the network socket and is responsible for
+        closing it. The wakeup pair is only used to interrupt that thread.
+        """
+        self.stop()
+
+        thread = self.thread
+        if thread is not None and thread is not threading.current_thread():
+            try:
+                thread.join(timeout=2)
+            except Exception as e:
+                debug(f"Failed joining Twitch IRC thread: {e!r}")
+
+        self.thread = None
+        self._destroy_wakeup_pair()
+        debug("IRC client shut down.")
+
+    #----------------------------------------------------------------------
+    def stop(self) -> None:
+        self.running = False
+        self._wake()
+
+    #----------------------------------------------------------------------
+    def send_chat(self, message: str) -> None:
+        self._send_raw(f"PRIVMSG #{self.channel} :{message}")
+
+    #----------------------------------------------------------------------
+    def _create_wakeup_pair(self) -> None:
+        self.wakeup_reader, self.wakeup_writer = socket.socketpair()
+
+    #----------------------------------------------------------------------
+    def _wake(self) -> None:
+        try:
+            if self.wakeup_writer is not None:
+                self.wakeup_writer.send(b"\x00")
+        except OSError as e:
+            debug(f"Failed to wake IRC thread: {e!r}")
+
+    #----------------------------------------------------------------------
+    def _drain_wakeup(self) -> None:
+        if self.wakeup_reader is None:
+            return
+
+        self.wakeup_reader.setblocking(False)
+
+        try:
+            while self.wakeup_reader.recv(4096):
+                pass
+        except BlockingIOError:
+            pass
+        except OSError:
+            pass
+        finally:
+            try:
+                self.wakeup_reader.setblocking(True)
+            except OSError:
+                pass
+
+    #----------------------------------------------------------------------
+    def _destroy_wakeup_pair(self) -> None:
+        for sock in (self.wakeup_reader, self.wakeup_writer):
+            try:
+                if sock is not None:
+                    sock.close()
+            except OSError:
+                debug(f"Failed to close IRC sockets: {e!r}")
+
+        self.wakeup_reader = None
+        self.wakeup_writer = None
+
+    #----------------------------------------------------------------------
+    def _connect(self) -> None:
+        """
+        Establish an SSL-wrapped socket connection.
+
+        Ref: https://stackoverflow.com/a/23615951/70876
+        """
+        sock = ssl.create_default_context().wrap_socket(
+            socket.create_connection(
+                (self.HOST, self.PORT),
+                timeout=10,
+            ),
+            server_hostname=self.HOST,
+        )
+        sock.setblocking(True)
+
+        self.socket = sock
+
+        # Ref: https://dev.twitch.tv/docs/chat/irc
+        self._send_raw("CAP REQ :twitch.tv/tags twitch.tv/commands")
+        self._send_raw(f"PASS oauth:{self.oauth}")
+        self._send_raw(f"NICK {self.username}")
+        self._send_raw(f"JOIN #{self.channel}")
+
+        debug("IRC client connected.")
+
+    #----------------------------------------------------------------------
+    def _receive_loop(self) -> None:
+        while self.running:
+            try:
+                self._connect()
+                self._read_loop()
+
+            except Exception as e:
+                if self.running:
+                    debug(f"Twitch IRC Listener: {e!r}")
+
+            finally:
+                self._close_socket()
+
+            if self.running:
+                self._wait_for_reconnect()
+
+    #----------------------------------------------------------------------
+    def _read_loop(self) -> None:
+        buffer = b""
+
+        while self.running:
+            readable, _, _ = select.select(
+                [self.socket, self.wakeup_reader],
+                [],
+                [],
+            )
+
+            if self.wakeup_reader in readable:
+                self._drain_wakeup()
+                return
+
+            if self.socket not in readable:
+                continue
+
+            data = self.socket.recv(4096)
+
+            if not data:
+                raise ConnectionError("EOF")
+
+            buffer += data
+
+            while b"\r\n" in buffer:
+                raw_line, buffer = buffer.split(b"\r\n", 1)
+                line = raw_line.decode("utf-8", errors="replace")
+                self._handle_line(line)
+
+                if not self.running:
+                    return
+
+    #----------------------------------------------------------------------
+    def _wait_for_reconnect(self) -> None:
+        if self.wakeup_reader is None:
+            return
+
+        try:
+            readable, _, _ = select.select(
+                [self.wakeup_reader],
+                [],
+                [],
+                self.RECONNECT_DELAY,
+            )
+
+            if readable:
+                self._drain_wakeup()
+
+        except OSError as e:
+            debug(f"Failed waiting for IRC reconnect: {e!r}")
+
+    #----------------------------------------------------------------------
+    def _close_socket(self) -> None:
+        """
+        Close the network socket.
+
+        This is called only by the receiver thread, which owns the socket.
+        """
+        sock = self.socket
+        self.socket = None
+
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    #----------------------------------------------------------------------
+    def _handle_line(self, line: str) -> None:
+        if line.startswith("PING"):
+            self._send_raw(line.replace("PING", "PONG", 1))
+            return
+
+        if line.startswith(":tmi.twitch.tv RECONNECT"):
+            raise ConnectionError("Twitch requested reconnect")
+
+        if (
+            " NOTICE * :Login authentication failed" in line
+            or " NOTICE * :Improperly formatted auth" in line
+        ):
+            debug("Twitch IRC authentication failed")
+            self.running = False
+            return
+
+        if " PRIVMSG " not in line:
+            return
+
+        msg = self._parse_privmsg(line)
+        if msg:
+            self.callback(msg)
+
+    #----------------------------------------------------------------------
+    def _parse_privmsg(self, line: str) -> ChatMessage | None:
+        if not line:
+            return None
+
+        try:
+            tags_raw, remainder = line.split(" ", 1)
+            prefix, command, channel, message = remainder.split(" ", 3)
+        except ValueError:
+            return None
+
+        if not tags_raw.startswith("@"):
+            return None
+
+        if command != "PRIVMSG":
+            return None
+
+        if not prefix.startswith(":"):
+            return None
+
+        if not message.startswith(":"):
+            return None
+
+        tags = self._parse_tags(tags_raw[1:])
+
+        username = prefix[1:].split("!", 1)[0]
+        if not username:
+            return None
+
+        badges = set(tags.get("badges", "").split(","))
+
+        return ChatMessage(
+            username,
+            tags.get("display-name", username),
+            message[1:],
+            tags.get("mod") == "1",
+            "broadcaster/1" in badges,
+        )
+
+    #----------------------------------------------------------------------
+    def _send_raw(self, line: str) -> None:
+        with self.send_lock:
+            sock = self.socket
+
+            if sock is None:
+                raise ConnectionError("IRC socket is not connected")
+
+            sock.sendall((line + "\r\n").encode("utf-8"))
+
+    #----------------------------------------------------------------------
+    @staticmethod
+    def _parse_tags(raw: str) -> Dict[str, str]:
+        result = {}
+
+        for field in raw.split(";"):
+            if "=" in field:
+                key, value = field.split("=", 1)
+                result[key] = value
+
+        return result
+
 
 ###########################################################################
 # Events class
+
 class Events:
     source_name: str = ''
     running: bool = False
@@ -17,6 +354,10 @@ class Events:
     stop_time: int = 0
     hide_time: int = 0
     #guesses: dict[str, int] = {}
+
+    token: str = ''
+    channel: str = ''
+    user: str = ''
 
     #----------------------------------------------------------------------
     def on_list_modified(self, props, prop, settings = None):
@@ -43,6 +384,24 @@ class Events:
         return True
 
     #----------------------------------------------------------------------
+    def on_token_modified(self, props, prop, settings = None):
+        # new_token = S.obs_data_get_string(settings, 'twitch_token')
+        # debug(f"OAuth token has changed: {self.token} -> {new_token}")
+        # if (
+        #     new_token is not None
+        #     and len(new_token) > 0
+        # ):
+        #     debug(f"TODO: Make API calls to populate user and channel here!")
+        #     self.user = 'beporter'
+        #     self.channel = 'beporter'
+
+        #     S.obs_data_set_string(settings, 'twitch_user', self.user)
+        #     S.obs_data_set_string(settings, 'twitch_channel', self.channel)
+
+        debug('on_token_modified complete.')
+        return True
+
+    #----------------------------------------------------------------------
     def on_start_button(self, props, prop, settings = None):
         """
         Callback fired from GUI button click.
@@ -65,18 +424,19 @@ class Events:
     def on_stop_button(self, props, prop, settings = None):
         """
         Callback fired from GUI button click.
+
+        Sets hide time for ticker to use to remove itself.
         """
         self.running = False
         self.stop_time = int(time.time())
         self.hide_time = self.stop_time + 120
         self.update_buttons(props)
 
-        # if not self.running:
-        #     debug('stopping any running timer')
-        #     OBS2.sceneitem_set_visible_by_name(self.source_name, False)
-        #     OBS2.timer_remove(self.ticker)
-
         return True # Always refresh the GUI.
+
+    #----------------------------------------------------------------------
+    def on_chat(self, msg: ChatMessage):
+        debug(f"Got a chat message to handle: {msg}")
 
     #----------------------------------------------------------------------
     def update_buttons(self, props):
@@ -118,110 +478,6 @@ class Events:
 
         dt: datetime.datetime = datetime.datetime.fromtimestamp(diff_secs, datetime.timezone.utc)
         return dt.strftime('%M:%S')
-
-###########################################################################
-# OBS Scripting API
-
-#--------------------------------------------------------------------------
-def script_description():
-    debug('script_description complete.')
-    return 'Testing modifying properties in realtime.'
-
-#--------------------------------------------------------------------------
-def script_properties():
-    """
-    GUI controls to show in OBS. This is called pretty late in the
-    startup process, so don't "modify" the controls here. (That has to
-    happen in an `obs_property_set_modified_callback()` handler.)
-
-    But the displayed controls should model the "first run" state. So
-    if a button should be hidden until a dropdown entry is selected, hide
-    the button in this method and let an eventual modified callback
-    unhide it when conditions are met.
-    """
-    props = S.obs_properties_create()
-
-    # Select text source list.
-    p = S.obs_properties_add_list(
-        props,
-        'source_prop',
-        "Text Source",
-        S.OBS_COMBO_TYPE_LIST,
-        S.OBS_COMBO_FORMAT_STRING,
-    )
-    S.obs_property_set_modified_callback(p, dispatch(e.on_list_modified))
-    sources = S.obs_enum_sources()
-    if sources is not None:
-        for source in sources:
-            source_id = S.obs_source_get_unversioned_id(source)
-            if source_id == "text_gdiplus" or source_id == "text_ft2_source":
-                name = S.obs_source_get_name(source)
-                S.obs_property_list_add_string(p, name, name)
-
-        S.source_list_release(sources)
-
-    # Button to start the timer. (Use the built-in callback, not set_modified_callback)
-    start_button = S.obs_properties_add_button(
-        props,
-        'start_button',
-        'Start timer',
-        dispatch(e.on_start_button),
-    )
-
-    # Button to stop the timer.
-    stop_button = S.obs_properties_add_button(
-        props,
-        'stop_button',
-        'Stop timer',
-        dispatch(e.on_stop_button),
-    )
-    S.obs_property_set_visible(stop_button, False) # Hide until a valid text source is selected.
-
-    debug('script_properties complete.')
-    return props
-
-#--------------------------------------------------------------------------
-def script_load(settings):
-    """
-    Run once when OBS first initializes this script. This is basically
-    the __init__ for this script as it exists in OBS. Happens before
-    the GUI is ready, so you can't query scenes or sources here.
-    """
-    debug(f"script_load setting running = False.")
-    e.running = False
-    debug(f"script_load importing source_global_name from settings.")
-    e.source_name = S.obs_data_get_string(settings, 'source_prop')
-
-    # from inspect import getmembers, isfunction
-    # obs_funcs = [x[0] for x in getmembers(S, isfunction)]
-    # for i in range(0, len(obs_funcs), 20):
-    #     print(obs_funcs[i:i+20])
-    # print(dict(getmembers(sys.modules[__name__], isfunction)).keys())
-
-    debug(f"script_load complete.")
-
-#--------------------------------------------------------------------------
-def script_update(settings):
-    """
-    Responsible for communicating the DATA behind the GUI props from obs
-    to this script. OBS will already preserve these settings, but we need
-    to get them into the script's runtime state for actual usage because
-    the `settings` object isn't directly available anywhere except here
-    are a few other places. The thing getting updated here is this very
-    script, not the settings and not OBS.
-    """
-    debug(f"script_update starting.")
-    e.source_name = S.obs_data_get_string(settings, 'source_prop')
-
-    debug('script_update complete.')
-
-#--------------------------------------------------------------------------
-def script_save(settings):
-    debug('script_save called.')
-
-#--------------------------------------------------------------------------
-def script_unload():
-    debug('script_unload called.')
 
 
 ###########################################################################
@@ -320,7 +576,179 @@ class OBS2:
             S.obs_source_release(source)
             S.obs_data_release(settings)
 
+
 ###########################################################################
 # Global State
 
-e = Events()
+e: Events = Events()
+irc_client: TwitchIRCClient = None
+
+
+###########################################################################
+# OBS Scripting API
+
+#--------------------------------------------------------------------------
+def script_description():
+    debug('script_description complete.')
+    return 'Testing modifying properties in realtime.'
+
+#--------------------------------------------------------------------------
+def script_properties():
+    """
+    GUI controls to show in OBS. This is called pretty late in the
+    startup process, so don't "modify" the controls here. (That has to
+    happen in an `obs_property_set_modified_callback()` handler.)
+
+    But the displayed controls should model the "first run" state. So
+    if a button should be hidden until a dropdown entry is selected, hide
+    the button in this method and let an eventual modified callback
+    unhide it when conditions are met.
+    """
+    props = S.obs_properties_create()
+
+    # Select text source list.
+    p = S.obs_properties_add_list(
+        props,
+        'source_prop',
+        "Text Source",
+        S.OBS_COMBO_TYPE_LIST,
+        S.OBS_COMBO_FORMAT_STRING,
+    )
+    S.obs_property_set_modified_callback(p, dispatch(e.on_list_modified))
+    sources = S.obs_enum_sources()
+    if sources is not None:
+        for source in sources:
+            source_id = S.obs_source_get_unversioned_id(source)
+            if source_id == "text_gdiplus" or source_id == "text_ft2_source":
+                name = S.obs_source_get_name(source)
+                S.obs_property_list_add_string(p, name, name)
+
+        S.source_list_release(sources)
+
+    b = S.obs_properties_add_button(
+        props,
+        'twitch_connect_button',
+        'Connect Twitch',
+        lambda: None,
+    )
+    S.obs_property_button_set_type(b, S.OBS_BUTTON_URL)
+    S.obs_property_button_set_url(b, 'https://beporter.github.io/brb-timer/start.html')
+    S.obs_property_set_long_description(
+        b,
+        (
+            'Open a browser window to obtain '
+            'a Twitch API token for this script to use. '
+            'Paste it below.'
+        ),
+    )
+
+    t = S.obs_properties_add_text(
+        props,
+        'twitch_token',
+        'Twitch OAuth Token',
+        S.OBS_TEXT_PASSWORD,
+    )
+    S.obs_property_set_modified_callback(t, dispatch(e.on_token_modified))
+
+    # Button to start the timer. (Use the built-in callback, not set_modified_callback)
+    start_button = S.obs_properties_add_button(
+        props,
+        'start_button',
+        'Start timer',
+        dispatch(e.on_start_button),
+    )
+
+    # Button to stop the timer.
+    stop_button = S.obs_properties_add_button(
+        props,
+        'stop_button',
+        'Stop timer',
+        dispatch(e.on_stop_button),
+    )
+    S.obs_property_set_visible(stop_button, False) # Hide until a valid text source is selected.
+
+    debug('script_properties complete.')
+    return props
+
+#--------------------------------------------------------------------------
+def script_load(settings):
+    """
+    Run once when OBS first initializes this script. This is basically
+    the __init__ for this script as it exists in OBS. Happens before
+    the GUI is ready, so you can't query scenes or sources here.
+    """
+    debug(f"script_load setting running = False.")
+    e.running = False
+    debug(f"script_load importing source_global_name from settings.")
+    e.source_name = S.obs_data_get_string(settings, 'source_prop')
+
+    # from inspect import getmembers, isfunction
+    # obs_funcs = [x[0] for x in getmembers(S, isfunction)]
+    # for i in range(0, len(obs_funcs), 20):
+    #     print(obs_funcs[i:i+20])
+    # print(dict(getmembers(sys.modules[__name__], isfunction)).keys())
+
+    debug(f"script_load complete.")
+
+#--------------------------------------------------------------------------
+def script_update(settings):
+    """
+    Responsible for communicating the DATA behind the GUI props from obs
+    to this script. OBS will already preserve these settings, but we need
+    to get them into the script's runtime state for actual usage because
+    the `settings` object isn't directly available anywhere except here
+    and a few other places. The thing getting updated here is this very
+    script, not the settings and not OBS.
+    """
+    global irc_client
+    debug(f"script_update starting.")
+    e.source_name = S.obs_data_get_string(settings, 'source_prop')
+
+    new_token = S.obs_data_get_string(settings, 'twitch_token')
+    if (
+        new_token is not None
+        and len(new_token) > 0
+        and new_token != e.token
+    ):
+        e.token = new_token
+        debug(f"TODO: Make API calls to populate user and channel here!")
+        e.user = 'beporter'
+        e.channel = 'beporter'
+
+        S.obs_data_set_string(settings, 'twitch_token', e.token)
+        S.obs_data_set_string(settings, 'twitch_user', e.user)
+        S.obs_data_set_string(settings, 'twitch_channel', e.channel)
+
+        if irc_client is not None:
+            irc_client.close()
+            irc_client = None
+
+    if (
+        len(e.token) > 0
+        and len(e.user) > 0
+        and len(e.channel) > 0
+        and irc_client is None
+    ):
+        irc_client = TwitchIRCClient(
+            e.channel,
+            e.user,
+            e.token,
+            e.on_chat,
+        )
+        irc_client.start()
+
+    debug('script_update complete.')
+
+#--------------------------------------------------------------------------
+def script_save(settings):
+    debug('script_save called.')
+
+#--------------------------------------------------------------------------
+def script_unload():
+    global irc_client
+
+    if irc_client is not None:
+        irc_client.close()
+        irc_client = None
+
+    debug('script_unload complete.')
