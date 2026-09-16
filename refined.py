@@ -15,6 +15,7 @@ class Events:
     running: bool = False
     start_time: int = 0
     stop_time: int = 0
+    hide_time: int = 0
     #guesses: dict[str, int] = {}
 
     #----------------------------------------------------------------------
@@ -50,6 +51,7 @@ class Events:
             self.running = True
             self.start_time = int(time.time())
             self.stop_time = 0
+            self.hide_time = 0
             self.update_buttons(props)
 
             debug('on_start_button starting timer')
@@ -66,12 +68,13 @@ class Events:
         """
         self.running = False
         self.stop_time = int(time.time())
+        self.hide_time = self.stop_time + 120
         self.update_buttons(props)
 
-        if not self.running:
-            debug('stopping any running timer')
-            OBS2.sceneitem_set_visible_by_name(self.source_name, False)
-            OBS2.timer_remove(self.ticker)
+        # if not self.running:
+        #     debug('stopping any running timer')
+        #     OBS2.sceneitem_set_visible_by_name(self.source_name, False)
+        #     OBS2.timer_remove(self.ticker)
 
         return True # Always refresh the GUI.
 
@@ -96,8 +99,9 @@ class Events:
         """
         debug('ticker called.')
 
-        if not self.running:
-            debug('running flag is off, removing self timer')
+        if self.hide_time > 0 and int(time.time()) > self.hide_time:
+            debug('hide_time reached, hiding ticker and removing self timer')
+            OBS2.sceneitem_set_visible_by_name(self.source_name, False)
             OBS2.timer_remove(self.ticker)
             return
 
@@ -107,7 +111,11 @@ class Events:
 
     #----------------------------------------------------------------------
     def ticker_text(self) -> str:
-        diff_secs: int = int(time.time()) - self.start_time
+        if self.running:
+            diff_secs: int = int(time.time()) - self.start_time
+        else:
+            diff_secs: int = self.stop_time - self.start_time
+
         dt: datetime.datetime = datetime.datetime.fromtimestamp(diff_secs, datetime.timezone.utc)
         return dt.strftime('%M:%S')
 
