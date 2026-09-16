@@ -5,13 +5,17 @@ import obspython as S
 import datetime
 import inspect
 import sys
+import time
 from typing import Callable
 
 ###########################################################################
 # Events class
 class Events:
-    source_name_global: str = ''
+    source_name: str = ''
     running: bool = False
+    start_time: int = 0
+    stop_time: int = 0
+    #guesses: dict[str, int] = {}
 
     #----------------------------------------------------------------------
     def on_list_modified(self, props, prop, settings = None):
@@ -32,7 +36,7 @@ class Events:
         if timer_source is not None:
             S.obs_source_release(timer_source)
             debug(f"timer source is valid: {source_name}")
-            self.source_name_global = source_name # Write to runtime settings.
+            self.source_name = source_name # Write to runtime settings.
 
         debug('on_list_modified complete.')
         return True
@@ -42,14 +46,16 @@ class Events:
         """
         Callback fired from GUI button click.
         """
-        self.running = True
-        self.update_buttons(props)
+        if self.source_name:
+            self.running = True
+            self.start_time = int(time.time())
+            self.stop_time = 0
+            self.update_buttons(props)
 
-        if self.source_name_global:
             debug('on_start_button starting timer')
-            OBS2.source_set_text_by_name(self.source_name_global, self.ticker_text())
+            OBS2.source_set_text_by_name(self.source_name, self.ticker_text())
             OBS2.timer_add(self.ticker, 1 * 1000)
-            OBS2.sceneitem_set_visible_by_name(self.source_name_global, True)
+            OBS2.sceneitem_set_visible_by_name(self.source_name, True)
 
         return True # Always refresh the GUI.
 
@@ -59,11 +65,12 @@ class Events:
         Callback fired from GUI button click.
         """
         self.running = False
+        self.stop_time = int(time.time())
         self.update_buttons(props)
 
         if not self.running:
             debug('stopping any running timer')
-            OBS2.sceneitem_set_visible_by_name(self.source_name_global, False)
+            OBS2.sceneitem_set_visible_by_name(self.source_name, False)
             OBS2.timer_remove(self.ticker)
 
         return True # Always refresh the GUI.
@@ -71,12 +78,12 @@ class Events:
     #----------------------------------------------------------------------
     def update_buttons(self, props):
         p = S.obs_properties_get(props, 'start_button')
-        show_start = bool(not self.running and self.source_name_global)
+        show_start = bool(not self.running and self.source_name)
         debug('update_buttons %s start button' % ('showing' if show_start else 'hiding'))
         S.obs_property_set_visible(p, show_start)
 
         p = S.obs_properties_get(props, 'stop_button')
-        show_stop = bool(self.running and self.source_name_global)
+        show_stop = bool(self.running and self.source_name)
         debug('update_buttons %s stop button' % ('showing' if show_stop else 'hiding'))
         S.obs_property_set_visible(p, show_stop)
 
@@ -94,13 +101,15 @@ class Events:
             OBS2.timer_remove(self.ticker)
             return
 
-        OBS2.source_set_text_by_name(self.source_name_global, self.ticker_text())
+        OBS2.source_set_text_by_name(self.source_name, self.ticker_text())
 
         debug(f"ticker complete.")
 
     #----------------------------------------------------------------------
     def ticker_text(self) -> str:
-        return datetime.datetime.now(datetime.timezone.utc).strftime('%M:%S')
+        diff_secs: int = int(time.time()) - self.start_time
+        dt: datetime.datetime = datetime.datetime.fromtimestamp(diff_secs, datetime.timezone.utc)
+        return dt.strftime('%M:%S')
 
 ###########################################################################
 # OBS Scripting API
@@ -173,7 +182,7 @@ def script_load(settings):
     debug(f"script_load setting running = False.")
     e.running = False
     debug(f"script_load importing source_global_name from settings.")
-    e.source_name_global = S.obs_data_get_string(settings, 'source_prop')
+    e.source_name = S.obs_data_get_string(settings, 'source_prop')
 
     # from inspect import getmembers, isfunction
     # obs_funcs = [x[0] for x in getmembers(S, isfunction)]
@@ -194,7 +203,7 @@ def script_update(settings):
     script, not the settings and not OBS.
     """
     debug(f"script_update starting.")
-    e.source_name_global = S.obs_data_get_string(settings, 'source_prop')
+    e.source_name = S.obs_data_get_string(settings, 'source_prop')
 
     debug('script_update complete.')
 
