@@ -1,25 +1,175 @@
 """
 Minimal implementation of BRB Timer, starting from working timer example in simple.py.
 """
-import obspython as S
+from __future__ import annotations
 from dataclasses import dataclass
 import datetime
+import http
 import inspect
+import json
 import select
 import socket
 import ssl
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Callable, Dict
 
+import obspython as S
 
 SCRIPT_NAME = "BRB Timer"
 SCRIPT_VERSION = 1.0
 
-
 ###########################################################################
 # Twitch IRC Client
+
+class TwitchApi:
+    """
+    Encapsulate http calls to Twitch's APIs.
+    """
+
+    # BRB Timer for Chat
+    # by beporter@users.sourceforge.net
+    # https://dev.twitch.tv/console/apps/ja5swzyzsr1euwm0e53h1sxqhk553l
+    APP_CLIENT_ID = "ja5swzyzsr1euwm0e53h1sxqhk553l"
+    OAUTH_SCOPES = [
+        # Receive and send irc chat messages.
+        # https://dev.twitch.tv/docs/api/reference/#send-chat-message
+        "chat:read",
+        "chat:edit",
+    ]
+    KICKOFF_URL = "https://beporter.github.io/brb-timer/start.html"
+
+    #----------------------------------------------------------------------
+    def __init__(self, token: str):
+        self.token = token
+
+    #----------------------------------------------------------------------
+    def validate(self) -> Dict[str, any] | False:
+        """
+        Check the passed oauth token to determine if it's still valid,
+        and who it belongs to.
+
+        Ref: https://dev.twitch.tv/docs/authentication/validate-tokens#how-to-validate-a-token
+        """
+        resp = self._get('oauth2/validate')
+
+        if not resp:
+            debug("oauth2/validate failed.")
+            return False
+
+        if not resp['login']:
+            debug("OAuth token is not attached to a user.")
+            return False
+
+        if not set(self.OAUTH_SCOPES).issubset(resp['scopes']):
+            missing_scopes = ", ".join(set(self.OAUTH_SCOPES) - set(resp['scopes']))
+            debug(
+                "OAuth token is lacking necessary scopes: (%s)" % (missing_scopes),
+            )
+            return False
+
+        return {
+            'login': resp.get('login', ''),
+            'broadcaster_id': int(resp.get('user_id', '')),
+            'expires_in': resp.get('expires_in', None), # int seconds
+        }
+
+    #----------------------------------------------------------------------
+    def channel(self, broadcaster_id: int) -> Dict[str, any]:
+        """
+        Get the provided broadcaster's channel details.
+
+        Ref: https://dev.twitch.tv/docs/api/reference#get-channel-information
+        """
+        resp = self._get('helix/channels', {'broadcaster_id': broadcaster_id})
+
+        if not resp:
+            debug(
+                "helix/channels failed for "
+                f"broadcaster_id: {broadcaster_id}"
+            )
+            return False
+
+        if not resp.get('data') or not resp.get('data', [False])[0]:
+            debug(
+                "No channel data returned for "
+                f"broadcaster_id: {broadcaster_id}"
+            )
+            return False
+
+        channel = resp.get('data')[0]
+
+        return channel.get('broadcaster_name', '')
+
+    # ---------------------------------------------------------------------
+    # Internal Helpers
+    # ---------------------------------------------------------------------
+
+    #----------------------------------------------------------------------
+    def _get(
+        self,
+        path: str,
+        params: Dict[str, str|int] = {},
+        extra_headers: Dict[str, str|int] = {},
+    ) -> object | False:
+        server = self._server(path)
+        url = f"{server}/{path}?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers=self._headers(extra_headers))
+
+        try:
+            with urllib.request.urlopen(req) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            match e.code:
+                case http.HTTPStatus.UNAUTHORIZED:
+                    try:
+                        detail = json.load(e.fp)
+                    except json.JSONDecodeError:
+                        detail = "Unauthorized. (Invalid JSON payload.)"
+                    except UnicodeDecodeError:
+                        detail = "Unauthorized. (Non-unicode payload.)"
+
+                # Ref: https://dev.twitch.tv/docs/api/guide/#twitch-rate-limits
+                case http.HTTPStatus.TOO_MANY_REQUESTS:
+                    total = e.headers.get('Ratelimit-Limit')
+                    remaining = e.headers.get('Ratelimit-Remaining')
+                    reset = e.headers.get('Ratelimit-Reset')
+                    detail = (
+                        f"Request for {e.url} was rate limited. "
+                        f"({remaining}/{total} requests remaining. "
+                        f"Reset in {reset!s} secs.)"
+                    )
+
+                case _:
+                    detail = e.reason
+
+            debug(detail)
+
+        return False
+
+    #----------------------------------------------------------------------
+    def _server(self, path: str) -> str:
+        match path.split('/', 2)[0]:
+            case 'oauth2':
+                return 'https://id.twitch.tv'
+            case _:
+                return 'https://api.twitch.tv'
+
+    #----------------------------------------------------------------------
+    def _headers(
+        self,
+        extra: dict[str, str|int] = {},
+    ) -> dict[str, str|int]:
+        return {
+            'User-Agent': f"{SCRIPT_NAME} v{SCRIPT_VERSION}",
+            'Accept': 'application/json',
+            'Authorization': f"Bearer {self.token}",
+            'Client-ID': self.APP_CLIENT_ID,
+        } | extra
 
 @dataclass
 class ChatMessage(object):
@@ -146,6 +296,16 @@ class TwitchIRCClient:
 
         self.wakeup_reader = None
         self.wakeup_writer = None
+
+    #----------------------------------------------------------------------
+    def _send_raw(self, line: str) -> None:
+        with self.send_lock:
+            sock = self.socket
+
+            if sock is None:
+                raise ConnectionError("IRC socket is not connected")
+
+            sock.sendall((line + "\r\n").encode("utf-8"))
 
     #----------------------------------------------------------------------
     def _connect(self) -> None:
@@ -322,16 +482,6 @@ class TwitchIRCClient:
         )
 
     #----------------------------------------------------------------------
-    def _send_raw(self, line: str) -> None:
-        with self.send_lock:
-            sock = self.socket
-
-            if sock is None:
-                raise ConnectionError("IRC socket is not connected")
-
-            sock.sendall((line + "\r\n").encode("utf-8"))
-
-    #----------------------------------------------------------------------
     @staticmethod
     def _parse_tags(raw: str) -> Dict[str, str]:
         result = {}
@@ -362,16 +512,9 @@ class Events:
     #----------------------------------------------------------------------
     def on_list_modified(self, props, prop, settings = None):
         """
-        Our callback that's fired from a GUI prop modification to
-        determine if GUI redraw is needed. Return True to tell OBS to
-        redraw the property widgets.
+        Our callback that's fired from the text source selection changing.
+        Return True to tell OBS to redraw the property widgets.
         """
-        debug(
-            f"entering on_list_modified. "
-            f"running is {self.running!s}. "
-            f"prop is {S.obs_property_name(prop)}"
-        )
-
         # If selected `source` exists, save it to runtime settings.
         source_name = S.obs_data_get_string(settings, 'source_prop')
         timer_source = S.obs_get_source_by_name(source_name)
@@ -385,19 +528,6 @@ class Events:
 
     #----------------------------------------------------------------------
     def on_token_modified(self, props, prop, settings = None):
-        # new_token = S.obs_data_get_string(settings, 'twitch_token')
-        # debug(f"OAuth token has changed: {self.token} -> {new_token}")
-        # if (
-        #     new_token is not None
-        #     and len(new_token) > 0
-        # ):
-        #     debug(f"TODO: Make API calls to populate user and channel here!")
-        #     self.user = 'beporter'
-        #     self.channel = 'beporter'
-
-        #     S.obs_data_set_string(settings, 'twitch_user', self.user)
-        #     S.obs_data_set_string(settings, 'twitch_channel', self.channel)
-
         debug('on_token_modified complete.')
         return True
 
@@ -436,10 +566,10 @@ class Events:
 
     #----------------------------------------------------------------------
     def on_chat(self, msg: ChatMessage):
-        debug(f"Got a chat message to handle: {msg}")
+        debug(f"TODO: Got a chat message to handle: {msg}")
 
     #----------------------------------------------------------------------
-    def update_buttons(self, props):
+    def update_buttons(self, props): # TODO: remove when start/stop buttons are removed.
         p = S.obs_properties_get(props, 'start_button')
         show_start = bool(not self.running and self.source_name)
         debug('update_buttons %s start button' % ('showing' if show_start else 'hiding'))
@@ -478,26 +608,6 @@ class Events:
 
         dt: datetime.datetime = datetime.datetime.fromtimestamp(diff_secs, datetime.timezone.utc)
         return dt.strftime('%M:%S')
-
-
-###########################################################################
-# Global Methods
-
-#--------------------------------------------------------------------------
-def debug(msg: str):
-    # Grab our frame and at most three parent frames.
-    stack = [f for f in inspect.stack(0) if f.frame.f_code.co_qualname not in ['dispatch.<locals>.handle']]
-    callers_caller_frameinfo = stack[0:3][-1]
-    calling_method = callers_caller_frameinfo.frame.f_code.co_qualname
-    S.script_log(S.LOG_DEBUG, f"[{calling_method}] {msg}")
-
-#--------------------------------------------------------------------------
-def dispatch(callback: callable) -> callable:
-    S.script_log(S.LOG_DEBUG, f"Creating closure for {callback.__qualname__}")
-    def handle(*args, **kwargs):
-        S.script_log(S.LOG_DEBUG, f"Triggering {callback.__qualname__}")
-        return callback(*args, **kwargs)
-    return handle
 
 
 ###########################################################################
@@ -578,6 +688,26 @@ class OBS2:
 
 
 ###########################################################################
+# Global Methods
+
+#--------------------------------------------------------------------------
+def debug(msg: str):
+    # Grab our frame and at most three parent frames.
+    stack = [f for f in inspect.stack(0) if f.frame.f_code.co_qualname not in ['dispatch.<locals>.handle']]
+    callers_caller_frameinfo = stack[0:3][-1]
+    calling_method = callers_caller_frameinfo.frame.f_code.co_qualname
+    S.script_log(S.LOG_DEBUG, f"[{calling_method}] {msg}")
+
+#--------------------------------------------------------------------------
+def dispatch(callback: callable) -> callable:
+    S.script_log(S.LOG_DEBUG, f"Creating closure for {callback.__qualname__}")
+    def handle(*args, **kwargs):
+        S.script_log(S.LOG_DEBUG, f"Triggering {callback.__qualname__}")
+        return callback(*args, **kwargs)
+    return handle
+
+
+###########################################################################
 # Global State
 
 e: Events = Events()
@@ -607,7 +737,7 @@ def script_properties():
     props = S.obs_properties_create()
 
     # Select text source list.
-    p = S.obs_properties_add_list(
+    p = S.obs_properties_add_list( # TODO: replace with auto-create-source
         props,
         'source_prop',
         "Text Source",
@@ -632,7 +762,7 @@ def script_properties():
         lambda: None,
     )
     S.obs_property_button_set_type(b, S.OBS_BUTTON_URL)
-    S.obs_property_button_set_url(b, 'https://beporter.github.io/brb-timer/start.html')
+    S.obs_property_button_set_url(b, TwitchApi.KICKOFF_URL)
     S.obs_property_set_long_description(
         b,
         (
@@ -651,7 +781,7 @@ def script_properties():
     S.obs_property_set_modified_callback(t, dispatch(e.on_token_modified))
 
     # Button to start the timer. (Use the built-in callback, not set_modified_callback)
-    start_button = S.obs_properties_add_button(
+    start_button = S.obs_properties_add_button( # TODO: remove
         props,
         'start_button',
         'Start timer',
@@ -659,7 +789,7 @@ def script_properties():
     )
 
     # Button to stop the timer.
-    stop_button = S.obs_properties_add_button(
+    stop_button = S.obs_properties_add_button( # TODO: remove
         props,
         'stop_button',
         'Stop timer',
@@ -679,7 +809,7 @@ def script_load(settings):
     """
     debug(f"script_load setting running = False.")
     e.running = False
-    debug(f"script_load importing source_global_name from settings.")
+    debug(f"script_load importing source_name from settings.")
     e.source_name = S.obs_data_get_string(settings, 'source_prop')
 
     # from inspect import getmembers, isfunction
@@ -711,9 +841,11 @@ def script_update(settings):
         and new_token != e.token
     ):
         e.token = new_token
-        debug(f"TODO: Make API calls to populate user and channel here!")
-        e.user = 'beporter'
-        e.channel = 'beporter'
+        api = TwitchApi(e.token)
+        valid = api.validate()
+        if valid:
+            e.user = valid['login']
+            e.channel = api.channel(valid['broadcaster_id'])
 
         S.obs_data_set_string(settings, 'twitch_token', e.token)
         S.obs_data_set_string(settings, 'twitch_user', e.user)
