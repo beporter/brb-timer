@@ -7,6 +7,7 @@ import datetime
 import http
 import inspect
 import json
+import re
 import select
 import socket
 import ssl
@@ -93,6 +94,69 @@ class MESSAGES(metaclass=MessageMeta):
         "You can't change your guess!"
     )
     GUESS_ACCEPTED = "{user} guesses {guess}."
+
+
+###########################################################################
+# Convience datetime and timedelta methods
+
+class DT:
+    """
+    Convenience datetime, timedelta and timezone helpers.
+
+    Always uses UTC.
+    """
+
+    #----------------------------------------------------------------------
+    @classmethod
+    def strfdelta(self, delta: int) -> str:
+        """
+        Format the provided int secs as a `[[HH:]MM:]SS` string.
+
+            DT.strfdelta(45) -> '%S secs'
+            DT.strfdelta(90) -> '%M:%S'
+            DT.strfdelta(7200) -> '%H:%M:%S'
+        """
+        if delta >= 3600:
+            fmt = '%H:%M:%S'
+        elif delta >= 60:
+            fmt = '%M:%S'
+        else:
+            fmt = '%S secs'
+
+        return datetime.datetime.fromtimestamp(
+            delta,
+            tz=datetime.timezone.utc,
+        ).strftime(fmt)
+
+    #----------------------------------------------------------------------
+    @classmethod
+    def strpdelta(self, time_str: str) -> int | False:
+        """
+        Parse the provided `[[HH:]MM:]SS` string into a integer number of seconds.
+
+        Ref: timedelta https://stackoverflow.com/a/51916936/70876
+        Ref: regex https://stackoverflow.com/a/8318367/70876
+        """
+        pattern = re.compile(
+            r'''
+                ^(?:
+                    (?:
+                        (?P<hours>[01]?\d|2[0-3]):
+                    )?
+                    (?P<minutes>[0-5]?\d):
+                )?
+                (?P<seconds>[0-5]?\d)$
+            ''',
+            re.X,
+        )
+        parts = pattern.match(time_str)
+        if parts is None:
+            return False
+
+        time_params = {name: float(param) for name, param
+                       in parts.groupdict().items() if param}
+
+        return int(datetime.timedelta(**time_params).total_seconds())
 
 
 ###########################################################################
@@ -705,8 +769,8 @@ class Events:
             self.hide_time = 0
 
             OBS2.source_set_text_by_name(self.source_name, self.ticker_text())
-            # OBS2.timer_add(self.ticker, 1 * 1000)
-            # OBS2.sceneitem_set_visible_by_name(self.source_name, True)
+            #OBS2.timer_add(self.ticker, 1 * 1000) # TODO: This is causing a crash. But only when called from irc, not from on_start_button
+            OBS2.sceneitem_set_visible_by_name(self.source_name, True)
 
     #----------------------------------------------------------------------
     def has_guess(self, username: str) -> int | False:
@@ -717,7 +781,7 @@ class Events:
 
     #----------------------------------------------------------------------
     def add_guess(self, username: str, seconds: int) -> bool:
-        if not self.active:
+        if not self.running:
             return False # Can't guess when brb isn't running.
 
         if self.has_guess(username) is not False:
@@ -761,7 +825,8 @@ class Events:
     def _qualified_guesses(self) -> Dict[str, int]:
         actual_secs = self.stop_time - self.start_time
 
-        # Exclude any guess larger than the actual seconds.
+        # Exclude any guess larger than the actual seconds. This may
+        # be an empty set.
         qualified = {
             username: seconds
             for username, seconds in self.guesses.items()
@@ -809,7 +874,7 @@ class Events:
             self.send_chat(MESSAGES.ALREADY_RUNNING)
             return
 
-        self.guess_start() # TODO: This is causing a crash. But only when called from irc, not from on_start_button
+        self.guess_start()
 
         # Send the starting chat message.
         self.send_chat(MESSAGES.BRB_STARTED(streamer=self.user))
@@ -822,34 +887,35 @@ class Events:
         Handle an !at command.
         """
         debug("Handling !at.")
-    #     if not self.is_guessing_running():
-    #         OBS.debug("No brb running.")
-    #         self.send_chat(MESSAGES.NO_BRB)
-    #         return
+        if not self.running:
+            debug("No brb running.")
+            self.send_chat(MESSAGES.NO_BRB)
+            return
 
-    #     parsed_delta = self._parse_at(msg.message)
-    #     if not parsed_delta:
-    #         OBS.error(f"Failed to parse !at in message: {msg}")
-    #         self.send_chat(MESSAGES.BAD_GUESS(user=msg.username))
-    #         return
+        [_cmd, time_str, *_rest] = msg.message.split()
+        delta = DT.strpdelta(time_str)
+        if not delta:
+            debug(f"Failed to parse !at in message: {msg}")
+            self.send_chat(MESSAGES.BAD_GUESS(user=msg.username))
+            return
 
-    #     existing_guess = self.guesses.has_guess(msg.username)
-    #     if existing_guess:
-    #         OBS.warn(f"User {msg.username} already has a guess registered: {existing_guess}")
-    #         self.send_chat(MESSAGES.ALREADY_GUESSED(
-    #             user=msg.username,
-    #             guess=DT.strfdelta(existing_guess),
-    #         ))
-    #         return
+        existing_guess = self.has_guess(msg.username)
+        if existing_guess:
+            debug(f"User {msg.username} already has a guess registered: {existing_guess}")
+            self.send_chat(MESSAGES.ALREADY_GUESSED(
+                user=msg.username,
+                guess=DT.strfdelta(existing_guess), # TODO: Format secs as MM:SS
+            ))
+            return
 
-    #     if self.guesses.add_guess(msg.username, parsed_delta.total_seconds()):
-    #         OBS.debug(f"Guess registered for user {msg.username}: {parsed_delta}")
-    #         self.send_chat(MESSAGES.GUESS_ACCEPTED(
-    #             user=msg.username,
-    #             guess=DT.strfdelta(parsed_delta),
-    #         ))
+        if self.add_guess(msg.username, delta):
+            debug(f"Guess registered for user {msg.username}: {delta}")
+            self.send_chat(MESSAGES.GUESS_ACCEPTED(
+                user=msg.username,
+                guess=DT.strfdelta(delta), # TODO: Format secs as MM:SS
+            ))
 
-    #     OBS.debug("!at handled.")
+        debug("!at handled.")
 
     #----------------------------------------------------------------------
     def command_back(self, msg: ChatMessage) -> None:
@@ -858,57 +924,41 @@ class Events:
         a !back command.
         """
         debug("Handling !back.")
-    #     # Validate command was sent by broadcaster or nod.
-    #     if not (msg.is_mod or msg.is_broadcaster):
-    #         OBS.debug("Only mods can run !back.")
-    #         self.send_chat(MESSAGES.ONLY_MOD_END)
-    #         return
+        # Validate command was sent by broadcaster or nod.
+        if not (msg.is_mod or msg.is_broadcaster):
+            debug("Only mods can run !back.")
+            self.send_chat(MESSAGES.ONLY_MOD_END)
+            return
 
-    #     if not self.is_guessing_running():
-    #         OBS.debug("No brb running.")
-    #         self.send_chat(MESSAGES.NO_BRB)
-    #         return
+        if not self.running:
+            debug("No brb running.")
+            self.send_chat(MESSAGES.NO_BRB)
+            return
 
-    #     # Disallow further guessing.
-    #     if self.is_guessing_running():
-    #         OBS.debug("Stopping guesses.")
-    #         self.guesses.end(self.settings.auto_hide_secs)
+        # Disallow further guessing.
+        if self.running:
+            debug("Stopping guesses.")
+            self.guess_end(self.auto_hide_secs)
 
-    #     # Announce the winner.
-    #     (winner, guess_secs) = self.guesses.winner()
-    #     if winner:
-    #         OBS.debug(f"!brb winner is: {winner}")
-    #         self.send_chat(MESSAGES.BRB_FINISHED(
-    #             streamer=self.settings.twitch_username,
-    #             time=DT.duration_str(DT.duration_secs_to_dt(self.guesses.elapsed_time().total_seconds())),
-    #             winner=winner,
-    #             diff=DT.duration_str(self.guesses.actual_secs - guess_secs),
-    #         ))
-    #     else:
-    #         OBS.debug("No guesses, so no winner.")
-    #         self.send_chat(MESSAGES.BRB_FINISHED_NO_GUESSES(
-    #             streamer=self.settings.twitch_username,
-    #             time=DT.duration_str(self.guesses.actual_secs),
-    #         ))
-    #     OBS.debug("!back handled.")
+        # Announce the winner.
+        (winner, guess_secs) = self.guess_winner()
+        actual_secs = self.stop_time - self.start_time
+        if winner:
+            debug(f"!brb winner is: {winner}")
+            self.send_chat(MESSAGES.BRB_FINISHED(
+                streamer=self.user,
+                time=DT.strfdelta(actual_secs), # TODO: Format secs as MM:SS
+                winner=winner,
+                diff=DT.strfdelta(actual_secs - guess_secs), # TODO: Format secs as MM:SS
+            ))
+        else:
+            debug("No guesses, so no winner.")
+            self.send_chat(MESSAGES.BRB_FINISHED_NO_GUESSES(
+                streamer=self.user,
+                time=DT.strfdelta(actual_secs), # TODO: Format secs as MM:SS
+            ))
 
-    # ---------------------------------------------------------------------
-    # Internal Helpers
-    # ---------------------------------------------------------------------
-
-    #----------------------------------------------------------------------
-    # def _parse_at(self, msg: str) -> datetime.timedelta | False:
-    #     """
-    #     Ref: timedelta https://stackoverflow.com/a/51916936/70876
-    #     Ref: regex https://stackoverflow.com/a/8318367/70876
-    #     """
-    #     [_cmd, time_str, *_rest] = msg.split()
-    #     delta = DT.strpdelta(time_str)
-    #     if not delta:
-    #         OBS.warn('Could not parse !at command argument: %s' % (msg))
-    #         return False
-
-    #     return delta
+        debug("!back handled.")
 
 
 ###########################################################################
