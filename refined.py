@@ -1055,12 +1055,6 @@ def script_defaults(
     process. Before `script_properties()` is even called for the first
     time.
     """
-    # S.obs_data_set_default_string(
-    #     settings,
-    #     "source_prop",
-    #     DEFAULTS.TEXT_TIMER,
-    # )
-
     S.obs_data_set_default_int(
         settings,
         "auto_hide_secs",
@@ -1121,7 +1115,6 @@ def script_load(settings):
     debug(f"script_load setting running = False.")
     e.running = False
     debug(f"script_load importing source_name from settings.")
-    e.source_name = S.obs_data_get_string(settings, 'source_prop')
 
     S.obs_frontend_add_event_callback(dispatch(e.on_event))
 
@@ -1149,7 +1142,6 @@ def script_update(settings):
     """
     global irc_client
     debug(f"script_update starting.")
-    e.source_name = S.obs_data_get_string(settings, 'source_prop')
 
     new_token = S.obs_data_get_string(settings, 'twitch_token')
     if (
