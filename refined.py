@@ -23,6 +23,78 @@ import obspython as S
 SCRIPT_NAME = "BRB Timer"
 SCRIPT_VERSION = 1.0
 
+# =========================================================================
+# Chat Commands and Messages
+
+class COMMANDS:
+    BRB = "!brb"
+    BACK = "!back"
+    AT = "!at"
+
+"""
+These next classes clean up the code that uses these format strings.
+Instead of:
+
+    str.format(MESSAGES.BRB_STARTED, streamer='some user')
+
+You can use:
+
+    MESSAGES.BRB_STARTED(streamer="some user")
+"""
+class Message(str):
+    def __call__(self, **kwargs):
+        return self.format(**kwargs)
+
+class MessageMeta(type):
+    def __getattribute__(cls, name):
+        value = super().__getattribute__(name)
+        if isinstance(value, str) and not isinstance(value, Message):
+            return Message(value)
+        return value
+
+class MESSAGES(metaclass=MessageMeta):
+    # Access control.
+    ONLY_MOD_START = f"Only mods can start a {COMMANDS.BRB}."
+    ONLY_MOD_END = f"Only mods can end a {COMMANDS.BRB} with {COMMANDS.BACK}."
+
+    # Reporting script state.
+    ALREADY_RUNNING = (
+        f"{COMMANDS.BRB} is already running! "
+        f"Must use {COMMANDS.BACK} first."
+    )
+    NO_BRB = (
+        f"There's no {COMMANDS.BRB} running. "
+        f"A mod must use {COMMANDS.BRB} first."
+    )
+    BRB_STARTED = (
+        "{streamer} is taking a break! "
+        "Guess how long till they're back (without going over!) "
+        f"Type `{COMMANDS.AT} MM:SS` in chat!"
+    )
+    BRB_FINISHED = (
+        "{streamer} is back after {time}! "
+        "Winner is: {winner}. They were {diff} off."
+    )
+    BRB_FINISHED_NO_GUESSES = (
+        "{streamer} is back after {time}! "
+        "But nobody registered any "
+        f"{COMMANDS.AT} guesses so there's no winner."
+    )
+
+    # Guessing.
+    BAD_GUESS = (
+        "Couldn't understand {user}'s guess. "
+        "Format is MINS:SECS. "
+        "For example: '35:42' means you think the streamer "
+        "will return in 35 mins and 42 seconds."
+    )
+    ALREADY_GUESSED = (
+        "{user} already guessed {guess}. "
+        "You can't change your guess!"
+    )
+    GUESS_ACCEPTED = "{user} guesses {guess}."
+
+
 ###########################################################################
 # Twitch IRC Client
 
@@ -502,8 +574,9 @@ class Events:
     running: bool = False
     start_time: int = 0
     stop_time: int = 0
+    auto_hide_secs: int = 120
     hide_time: int = 0
-    #guesses: dict[str, int] = {}
+    guesses: dict[str, int] = {}
 
     token: str = ''
     channel: str = ''
@@ -536,18 +609,10 @@ class Events:
         """
         Callback fired from GUI button click.
         """
-        if self.source_name:
-            self.running = True
-            self.start_time = int(time.time())
-            self.stop_time = 0
-            self.hide_time = 0
-            self.update_buttons(props)
+        self.guess_start()
+        self.update_buttons(props)
 
-            debug('on_start_button starting timer')
-            OBS2.source_set_text_by_name(self.source_name, self.ticker_text())
-            OBS2.timer_add(self.ticker, 1 * 1000)
-            OBS2.sceneitem_set_visible_by_name(self.source_name, True)
-
+        debug('on_start_button complete')
         return True # Always refresh the GUI.
 
     #----------------------------------------------------------------------
@@ -557,16 +622,35 @@ class Events:
 
         Sets hide time for ticker to use to remove itself.
         """
-        self.running = False
-        self.stop_time = int(time.time())
-        self.hide_time = self.stop_time + 120
+        self.guess_end(self.auto_hide_secs)
         self.update_buttons(props)
 
+        debug('on_stop_button complete')
         return True # Always refresh the GUI.
 
     #----------------------------------------------------------------------
-    def on_chat(self, msg: ChatMessage):
-        debug(f"TODO: Got a chat message to handle: {msg}")
+    def on_chat(self, message: ChatMessage) -> None:
+        """
+        Invoked by the IRC client whenever a chat message is received.
+
+        This router is only responsible for determining whether to
+        respond to an event and dispatching it, or ignore it.
+        """
+        # TODO: Implement replies? https://dev.twitch.tv/docs/chat/irc/#replying-to-a-chat-message
+
+        match message.message.split()[0]:
+            case COMMANDS.BRB:
+                self.command_brb(message)
+            case COMMANDS.AT:
+                self.command_at(message)
+            case COMMANDS.BACK:
+                self.command_back(message)
+            case 'show':
+                OBS2.sceneitem_set_visible_by_name(self.source_name, True)
+            case 'hide':
+                OBS2.sceneitem_set_visible_by_name(self.source_name, False)
+            case _:
+                debug('No BRB commands matched. Skipping.')
 
     #----------------------------------------------------------------------
     def update_buttons(self, props): # TODO: remove when start/stop buttons are removed.
@@ -609,11 +693,227 @@ class Events:
         dt: datetime.datetime = datetime.datetime.fromtimestamp(diff_secs, datetime.timezone.utc)
         return dt.strftime('%M:%S')
 
+    #----------------------------------------------------------------------
+    def guess_start(self) -> None:
+        if self.running:
+            return
+
+        if self.source_name:
+            self.running = True
+            self.start_time = int(time.time())
+            self.stop_time = 0
+            self.hide_time = 0
+
+            OBS2.source_set_text_by_name(self.source_name, self.ticker_text())
+            # OBS2.timer_add(self.ticker, 1 * 1000)
+            # OBS2.sceneitem_set_visible_by_name(self.source_name, True)
+
+    #----------------------------------------------------------------------
+    def has_guess(self, username: str) -> int | False:
+        if username in self.guesses:
+            return self.guesses[username]
+
+        return False
+
+    #----------------------------------------------------------------------
+    def add_guess(self, username: str, seconds: int) -> bool:
+        if not self.active:
+            return False # Can't guess when brb isn't running.
+
+        if self.has_guess(username) is not False:
+            return False # User already has a guess registered.
+
+        self.guesses[username] = seconds
+        return True # Guess added.
+
+    #----------------------------------------------------------------------
+    def guess_end(self, auto_hide_secs: int) -> None:
+        # Handle a stream ending with no !brb's having been run.
+        if not self.running:
+            return
+
+        # Otherwise shut down cleanly.
+        self.running = False
+        self.stop_time = int(time.time())
+        self.hide_time = self.stop_time + auto_hide_secs
+
+    #----------------------------------------------------------------------
+    def guess_winner(self) -> tuple[str, int] | tuple[False, None]:
+        """
+        Returns false if no !brb has run, or is still running, or if
+        nobody registered any guesses.
+
+        Returns a tuple of (username, guessed_secs) when a winner is
+        present.
+        """
+        if self.running or len(self.guesses) == 0:
+            return (False, None) # No winner when brb is still active or nobody guessed.
+
+        qualified = self._qualified_guesses()
+        if not qualified:
+            return (False, None)
+
+        winner_username, guessed_secs = next(reversed(qualified.items()))
+
+        return (winner_username, guessed_secs)
+
+    #----------------------------------------------------------------------
+    def _qualified_guesses(self) -> Dict[str, int]:
+        actual_secs = self.stop_time - self.start_time
+
+        # Exclude any guess larger than the actual seconds.
+        qualified = {
+            username: seconds
+            for username, seconds in self.guesses.items()
+            if seconds <= actual_secs
+        }
+
+        # Sort the remaining guesses by number of seconds. The
+        # largest (last) guess is the one closest to actual_secs
+        # without going over.
+        return dict(
+            sorted(
+                qualified.items(),
+                key=lambda item: item[1],
+            )
+        )
+
+    #----------------------------------------------------------------------
+    def send_chat(self, msg: str) -> None:
+        """
+        Convenience/consistency wrapper for sending messages out through
+        IRC. Ensures the client is started.
+        """
+        global irc_client
+
+        if irc_client is None or not irc_client.running:
+            debug(f"Tried to send irc chat, but client is not connected. ({msg})")
+            return
+
+        irc_client.send_chat(msg)
+
+    #----------------------------------------------------------------------
+    def command_brb(self, msg: ChatMessage) -> None:
+        """
+        Handle a !brb command.
+        """
+        debug("Handling !brb.")
+        # Validate command was sent by broadcaster or nod.
+        if not (msg.is_mod or msg.is_broadcaster):
+            debug("Only mods can start brb.")
+            self.send_chat(MESSAGES.ONLY_MOD_START)
+            return
+
+        if self.running:
+            debug("brb already running.")
+            self.send_chat(MESSAGES.ALREADY_RUNNING)
+            return
+
+        self.guess_start() # TODO: This is causing a crash. But only when called from irc, not from on_start_button
+
+        # Send the starting chat message.
+        self.send_chat(MESSAGES.BRB_STARTED(streamer=self.user))
+
+        debug("brb handled.")
+
+    #----------------------------------------------------------------------
+    def command_at(self, msg: ChatMessage) -> None:
+        """
+        Handle an !at command.
+        """
+        debug("Handling !at.")
+    #     if not self.is_guessing_running():
+    #         OBS.debug("No brb running.")
+    #         self.send_chat(MESSAGES.NO_BRB)
+    #         return
+
+    #     parsed_delta = self._parse_at(msg.message)
+    #     if not parsed_delta:
+    #         OBS.error(f"Failed to parse !at in message: {msg}")
+    #         self.send_chat(MESSAGES.BAD_GUESS(user=msg.username))
+    #         return
+
+    #     existing_guess = self.guesses.has_guess(msg.username)
+    #     if existing_guess:
+    #         OBS.warn(f"User {msg.username} already has a guess registered: {existing_guess}")
+    #         self.send_chat(MESSAGES.ALREADY_GUESSED(
+    #             user=msg.username,
+    #             guess=DT.strfdelta(existing_guess),
+    #         ))
+    #         return
+
+    #     if self.guesses.add_guess(msg.username, parsed_delta.total_seconds()):
+    #         OBS.debug(f"Guess registered for user {msg.username}: {parsed_delta}")
+    #         self.send_chat(MESSAGES.GUESS_ACCEPTED(
+    #             user=msg.username,
+    #             guess=DT.strfdelta(parsed_delta),
+    #         ))
+
+    #     OBS.debug("!at handled.")
+
+    #----------------------------------------------------------------------
+    def command_back(self, msg: ChatMessage) -> None:
+        """
+        Handler that's called when self.irc returns a ChatMessage with
+        a !back command.
+        """
+        debug("Handling !back.")
+    #     # Validate command was sent by broadcaster or nod.
+    #     if not (msg.is_mod or msg.is_broadcaster):
+    #         OBS.debug("Only mods can run !back.")
+    #         self.send_chat(MESSAGES.ONLY_MOD_END)
+    #         return
+
+    #     if not self.is_guessing_running():
+    #         OBS.debug("No brb running.")
+    #         self.send_chat(MESSAGES.NO_BRB)
+    #         return
+
+    #     # Disallow further guessing.
+    #     if self.is_guessing_running():
+    #         OBS.debug("Stopping guesses.")
+    #         self.guesses.end(self.settings.auto_hide_secs)
+
+    #     # Announce the winner.
+    #     (winner, guess_secs) = self.guesses.winner()
+    #     if winner:
+    #         OBS.debug(f"!brb winner is: {winner}")
+    #         self.send_chat(MESSAGES.BRB_FINISHED(
+    #             streamer=self.settings.twitch_username,
+    #             time=DT.duration_str(DT.duration_secs_to_dt(self.guesses.elapsed_time().total_seconds())),
+    #             winner=winner,
+    #             diff=DT.duration_str(self.guesses.actual_secs - guess_secs),
+    #         ))
+    #     else:
+    #         OBS.debug("No guesses, so no winner.")
+    #         self.send_chat(MESSAGES.BRB_FINISHED_NO_GUESSES(
+    #             streamer=self.settings.twitch_username,
+    #             time=DT.duration_str(self.guesses.actual_secs),
+    #         ))
+    #     OBS.debug("!back handled.")
+
+    # ---------------------------------------------------------------------
+    # Internal Helpers
+    # ---------------------------------------------------------------------
+
+    #----------------------------------------------------------------------
+    # def _parse_at(self, msg: str) -> datetime.timedelta | False:
+    #     """
+    #     Ref: timedelta https://stackoverflow.com/a/51916936/70876
+    #     Ref: regex https://stackoverflow.com/a/8318367/70876
+    #     """
+    #     [_cmd, time_str, *_rest] = msg.split()
+    #     delta = DT.strpdelta(time_str)
+    #     if not delta:
+    #         OBS.warn('Could not parse !at command argument: %s' % (msg))
+    #         return False
+
+    #     return delta
+
 
 ###########################################################################
 # Timers
 
-#--------------------------------------------------------------------------
 type OBSTimer = Callable[[], None]
 
 class OBS2:
@@ -671,16 +971,16 @@ class OBS2:
             if S.obs_sceneitem_visible(si) is not visible:
                 debug(f"{'showing' if visible else 'hiding'} sceneitem.")
                 S.obs_sceneitem_set_visible(si, visible)
-            #S.obs_sceneitem_release(si)
+            #S.obs_sceneitem_release(si) # DON'T release??
             S.obs_source_release(scene_source)
 
     #----------------------------------------------------------------------
     @classmethod
     def source_set_text_by_name(self, source_name: str, text: str) -> None:
-        source = S.obs_get_source_by_name(source_name)
+        source = S.obs_get_source_by_name(source_name) # Release!
         if source is not None:
             debug(f"updating text contents to {text}")
-            settings = S.obs_data_create()
+            settings = S.obs_data_create() # Release!
             S.obs_data_set_string(settings, "text", text)
             S.obs_source_update(source, settings)
             S.obs_source_release(source)
@@ -847,9 +1147,8 @@ def script_update(settings):
             e.user = valid['login']
             e.channel = api.channel(valid['broadcaster_id'])
 
-        S.obs_data_set_string(settings, 'twitch_token', e.token)
-        S.obs_data_set_string(settings, 'twitch_user', e.user)
-        S.obs_data_set_string(settings, 'twitch_channel', e.channel)
+            S.obs_data_set_string(settings, 'twitch_user', e.user)
+            S.obs_data_set_string(settings, 'twitch_channel', e.channel)
 
         if irc_client is not None:
             irc_client.close()
