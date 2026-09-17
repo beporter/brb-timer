@@ -632,11 +632,12 @@ class Events:
         if event != S.OBS_FRONTEND_EVENT_FINISHED_LOADING:
             return
 
-        if OBS2.source_exists(self.source_name):
-            debug(f"Soource {self.source_name} already exists.")
-            return
+        if not OBS2.source_exists(self.source_name):
+            debug(f"TODO: create source {self.source_name} here")
 
-        debug(f"TODO: create source {self.source_name} here")
+        # Make sure the timer is hidden on startup.
+        OBS2.sceneitem_set_visible_by_name(self.source_name, False)
+        debug(f"on_event complete")
 
     #----------------------------------------------------------------------
     def on_chat(self, message: ChatMessage) -> None:
@@ -657,6 +658,14 @@ class Events:
             #     OBS2.sceneitem_set_visible_by_name(self.source_name, True)
             # case 'hide':
             #     OBS2.sceneitem_set_visible_by_name(self.source_name, False)
+            # case 'start': #  TODO: remove
+            #     #q.put('start')
+            #     self.running = True
+            #     OBS2.sceneitem_set_visible_by_name(self.source_name, True)
+            # case 'stop':
+            #     #q.put('stop')
+            #     self.running = False
+            #     OBS2.sceneitem_set_visible_by_name(self.source_name, False)
             case _:
                 debug('No BRB commands matched. Skipping.')
 
@@ -668,11 +677,21 @@ class Events:
         props for this script. Can NOT be scheduled via obs.timer_add()
         from a separate python thread (such as the irc client).
         """
+        # debug(
+        #     f"timer running. "
+        #     f"source = {self.source_name}, "
+        #     f"running = {self.running}, "
+        #     f"hide_time = {self.hide_time}, "
+        #     f"text = {self.ticker_text()} "
+        # )
+        if not self.running:
+            return
+
         if self.hide_time > 0 and int(time.time()) > self.hide_time:
-            debug('hide_time reached, hiding on-screen text and removing timer')
+            debug('hide_time reached, hiding on-screen text')
             OBS2.sceneitem_set_visible_by_name(self.source_name, False)
             #OBS2.timer_remove(self.ticker)
-            S.remove_current_callback()
+            #S.remove_current_callback()
             return
 
         OBS2.source_set_text_by_name(self.source_name, self.ticker_text())
@@ -1170,6 +1189,8 @@ def script_update(settings):
 
 #--------------------------------------------------------------------------
 def script_unload():
+    S.timer_remove(e.ticker)
+
     global irc_client
 
     if irc_client is not None:
