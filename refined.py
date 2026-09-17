@@ -11,12 +11,10 @@ import re
 import select
 import socket
 import ssl
-import sys
+from textwrap import dedent
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
+from urllib import error, parse, request
 from typing import Callable, Dict
 
 import obspython as S
@@ -25,27 +23,27 @@ SCRIPT_NAME = "BRB Timer"
 SCRIPT_VERSION = 1.0
 
 # =========================================================================
+class DEFAULTS:
+    AUTO_HIDE_SECS = 120
+    TEXT_TIMER = f"{SCRIPT_NAME} - Timer"
+    TRANSITION_SHOW = f"{SCRIPT_NAME} - Show Transition"
+    TRANSITION_HIDE = f"{SCRIPT_NAME} - Hide Transition"
+
+###########################################################################
 # Chat Commands and Messages
 
+# =========================================================================
 class COMMANDS:
     BRB = "!brb"
     BACK = "!back"
     AT = "!at"
 
-"""
-These next classes clean up the code that uses these format strings.
-Instead of:
-
-    str.format(MESSAGES.BRB_STARTED, streamer='some user')
-
-You can use:
-
-    MESSAGES.BRB_STARTED(streamer="some user")
-"""
+# =========================================================================
 class Message(str):
     def __call__(self, **kwargs):
         return self.format(**kwargs)
 
+# =========================================================================
 class MessageMeta(type):
     def __getattribute__(cls, name):
         value = super().__getattribute__(name)
@@ -53,7 +51,18 @@ class MessageMeta(type):
             return Message(value)
         return value
 
+# =========================================================================
 class MESSAGES(metaclass=MessageMeta):
+    """
+    This class cleans up the code that uses these format strings.
+    Instead of:
+
+        str.format(MESSAGES.BRB_STARTED, streamer='some user')
+
+    You can use:
+
+        MESSAGES.BRB_STARTED(streamer="some user")
+    """
     # Access control.
     ONLY_MOD_START = f"Only mods can start a {COMMANDS.BRB}."
     ONLY_MOD_END = f"Only mods can end a {COMMANDS.BRB} with {COMMANDS.BACK}."
@@ -78,16 +87,17 @@ class MESSAGES(metaclass=MessageMeta):
     )
     BRB_FINISHED_NO_GUESSES = (
         "{streamer} is back after {time}! "
-        "But nobody registered any "
-        f"{COMMANDS.AT} guesses so there's no winner."
+        "But there were no valid "
+        f"{COMMANDS.AT} guesses so there's no winner. "
+        "(Price is Right rules: closest without going over!)"
     )
 
     # Guessing.
     BAD_GUESS = (
         "Couldn't understand {user}'s guess. "
         "Format is MINS:SECS. "
-        "For example: '35:42' means you think the streamer "
-        "will return in 35 mins and 42 seconds."
+        "For example: '1:35:42' means you think the streamer "
+        "will return in 1 hour, 35 mins and 42 seconds."
     )
     ALREADY_GUESSED = (
         "{user} already guessed {guess}. "
@@ -99,23 +109,11 @@ class MESSAGES(metaclass=MessageMeta):
 ###########################################################################
 # Convience datetime and timedelta methods
 
+# =========================================================================
 class DT:
-    """
-    Convenience datetime, timedelta and timezone helpers.
-
-    Always uses UTC.
-    """
-
     #----------------------------------------------------------------------
     @classmethod
     def strfdelta(self, delta: int) -> str:
-        """
-        Format the provided int secs as a `[[HH:]MM:]SS` string.
-
-            DT.strfdelta(45) -> '%S secs'
-            DT.strfdelta(90) -> '%M:%S'
-            DT.strfdelta(7200) -> '%H:%M:%S'
-        """
         if delta >= 3600:
             fmt = '%H:%M:%S'
         elif delta >= 60:
@@ -126,7 +124,7 @@ class DT:
         return datetime.datetime.fromtimestamp(
             delta,
             tz=datetime.timezone.utc,
-        ).strftime(fmt)
+        ).strftime(fmt).lstrip('0')
 
     #----------------------------------------------------------------------
     @classmethod
@@ -162,18 +160,15 @@ class DT:
 ###########################################################################
 # Twitch IRC Client
 
+# =========================================================================
 class TwitchApi:
     """
     Encapsulate http calls to Twitch's APIs.
     """
-
-    # BRB Timer for Chat
-    # by beporter@users.sourceforge.net
+    # BRB Timer for Chat by beporter@users.sourceforge.net
     # https://dev.twitch.tv/console/apps/ja5swzyzsr1euwm0e53h1sxqhk553l
     APP_CLIENT_ID = "ja5swzyzsr1euwm0e53h1sxqhk553l"
-    OAUTH_SCOPES = [
-        # Receive and send irc chat messages.
-        # https://dev.twitch.tv/docs/api/reference/#send-chat-message
+    OAUTH_SCOPES = [ # https://dev.twitch.tv/docs/api/reference/#send-chat-message
         "chat:read",
         "chat:edit",
     ]
@@ -204,7 +199,8 @@ class TwitchApi:
         if not set(self.OAUTH_SCOPES).issubset(resp['scopes']):
             missing_scopes = ", ".join(set(self.OAUTH_SCOPES) - set(resp['scopes']))
             debug(
-                "OAuth token is lacking necessary scopes: (%s)" % (missing_scopes),
+                "OAuth token is lacking necessary scopes: "
+                f"{missing_scopes!s}"
             )
             return False
 
@@ -238,12 +234,7 @@ class TwitchApi:
             return False
 
         channel = resp.get('data')[0]
-
         return channel.get('broadcaster_name', '')
-
-    # ---------------------------------------------------------------------
-    # Internal Helpers
-    # ---------------------------------------------------------------------
 
     #----------------------------------------------------------------------
     def _get(
@@ -253,13 +244,13 @@ class TwitchApi:
         extra_headers: Dict[str, str|int] = {},
     ) -> object | False:
         server = self._server(path)
-        url = f"{server}/{path}?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url, headers=self._headers(extra_headers))
+        url = f"{server}/{path}?" + parse.urlencode(params)
+        req = request.Request(url, headers=self._headers(extra_headers))
 
         try:
-            with urllib.request.urlopen(req) as r:
+            with request.urlopen(req) as r:
                 return json.load(r)
-        except urllib.error.HTTPError as e:
+        except error.HTTPError as e:
             match e.code:
                 case http.HTTPStatus.UNAUTHORIZED:
                     try:
@@ -307,6 +298,7 @@ class TwitchApi:
             'Client-ID': self.APP_CLIENT_ID,
         } | extra
 
+# =========================================================================
 @dataclass
 class ChatMessage(object):
     """
@@ -318,6 +310,7 @@ class ChatMessage(object):
     is_mod: bool
     is_broadcaster: bool
 
+# =========================================================================
 type IrcMsgCallback = Callable[[ChatMessage], None]
 
 class TwitchIRCClient:
@@ -365,7 +358,7 @@ class TwitchIRCClient:
         Permanently close the client.
 
         The receiver thread owns the network socket and is responsible for
-        closing it. The wakeup pair is only used to interrupt that thread.
+        closing it. The wakeup pair is only used to signal that thread.
         """
         self.stop()
 
@@ -407,7 +400,6 @@ class TwitchIRCClient:
             return
 
         self.wakeup_reader.setblocking(False)
-
         try:
             while self.wakeup_reader.recv(4096):
                 pass
@@ -436,12 +428,10 @@ class TwitchIRCClient:
     #----------------------------------------------------------------------
     def _send_raw(self, line: str) -> None:
         with self.send_lock:
-            sock = self.socket
-
-            if sock is None:
+            if self.socket is None:
                 raise ConnectionError("IRC socket is not connected")
 
-            sock.sendall((line + "\r\n").encode("utf-8"))
+            self.socket.sendall((line + "\r\n").encode("utf-8"))
 
     #----------------------------------------------------------------------
     def _connect(self) -> None:
@@ -458,7 +448,6 @@ class TwitchIRCClient:
             server_hostname=self.HOST,
         )
         sock.setblocking(True)
-
         self.socket = sock
 
         # Ref: https://dev.twitch.tv/docs/chat/irc
@@ -496,7 +485,6 @@ class TwitchIRCClient:
                 [],
                 [],
             )
-
             if self.wakeup_reader in readable:
                 self._drain_wakeup()
                 return
@@ -505,12 +493,10 @@ class TwitchIRCClient:
                 continue
 
             data = self.socket.recv(4096)
-
             if not data:
                 raise ConnectionError("EOF")
 
             buffer += data
-
             while b"\r\n" in buffer:
                 raw_line, buffer = buffer.split(b"\r\n", 1)
                 line = raw_line.decode("utf-8", errors="replace")
@@ -543,7 +529,8 @@ class TwitchIRCClient:
         """
         Close the network socket.
 
-        This is called only by the receiver thread, which owns the socket.
+        This is exclusively called by the receiver thread, which owns
+        the socket.
         """
         sock = self.socket
         self.socket = None
@@ -589,25 +576,19 @@ class TwitchIRCClient:
         except ValueError:
             return None
 
-        if not tags_raw.startswith("@"):
-            return None
-
-        if command != "PRIVMSG":
-            return None
-
-        if not prefix.startswith(":"):
-            return None
-
-        if not message.startswith(":"):
+        if (
+            not tags_raw.startswith("@")
+            or command != "PRIVMSG"
+            or not prefix.startswith(":")
+            or not message.startswith(":")
+        ):
             return None
 
         tags = self._parse_tags(tags_raw[1:])
-
+        badges = set(tags.get("badges", "").split(","))
         username = prefix[1:].split("!", 1)[0]
         if not username:
             return None
-
-        badges = set(tags.get("badges", "").split(","))
 
         return ChatMessage(
             username,
@@ -621,7 +602,6 @@ class TwitchIRCClient:
     @staticmethod
     def _parse_tags(raw: str) -> Dict[str, str]:
         result = {}
-
         for field in raw.split(";"):
             if "=" in field:
                 key, value = field.split("=", 1)
@@ -633,12 +613,13 @@ class TwitchIRCClient:
 ###########################################################################
 # Events class
 
+# =========================================================================
 class Events:
-    source_name: str = ''
+    source_name: str = DEFAULTS.TEXT_TIMER
     running: bool = False
     start_time: int = 0
     stop_time: int = 0
-    auto_hide_secs: int = 120
+    auto_hide_secs: int = DEFAULTS.AUTO_HIDE_SECS
     hide_time: int = 0
     guesses: dict[str, int] = {}
 
@@ -647,50 +628,15 @@ class Events:
     user: str = ''
 
     #----------------------------------------------------------------------
-    def on_list_modified(self, props, prop, settings = None):
-        """
-        Our callback that's fired from the text source selection changing.
-        Return True to tell OBS to redraw the property widgets.
-        """
-        # If selected `source` exists, save it to runtime settings.
-        source_name = S.obs_data_get_string(settings, 'source_prop')
-        timer_source = S.obs_get_source_by_name(source_name)
-        if timer_source is not None:
-            S.obs_source_release(timer_source)
-            debug(f"timer source is valid: {source_name}")
-            self.source_name = source_name # Write to runtime settings.
+    def on_event(self, event):
+        if event != S.OBS_FRONTEND_EVENT_FINISHED_LOADING:
+            return
 
-        debug('on_list_modified complete.')
-        return True
+        if OBS2.source_exists(self.source_name):
+            debug(f"Soource {self.source_name} already exists.")
+            return
 
-    #----------------------------------------------------------------------
-    def on_token_modified(self, props, prop, settings = None):
-        debug('on_token_modified complete.')
-        return True
-
-    #----------------------------------------------------------------------
-    def on_start_button(self, props, prop, settings = None):
-        """
-        Callback fired from GUI button click.
-        """
-        self.guess_start()
-        self.update_buttons(props)
-
-        debug('on_start_button complete')
-        return True # Always refresh the GUI.
-
-    #----------------------------------------------------------------------
-    def on_stop_button(self, props, prop, settings = None):
-        """
-        Callback fired from GUI button click.
-
-        Sets hide time for ticker to use to remove itself.
-        """
-        self.guess_end(self.auto_hide_secs)
-        self.update_buttons(props)
-
-        debug('on_stop_button complete')
-        return True # Always refresh the GUI.
+        debug(f"TODO: create source {self.source_name} here")
 
     #----------------------------------------------------------------------
     def on_chat(self, message: ChatMessage) -> None:
@@ -700,8 +646,6 @@ class Events:
         This router is only responsible for determining whether to
         respond to an event and dispatching it, or ignore it.
         """
-        # TODO: Implement replies? https://dev.twitch.tv/docs/chat/irc/#replying-to-a-chat-message
-
         match message.message.split()[0]:
             case COMMANDS.BRB:
                 self.command_brb(message)
@@ -709,43 +653,29 @@ class Events:
                 self.command_at(message)
             case COMMANDS.BACK:
                 self.command_back(message)
-            case 'show':
-                OBS2.sceneitem_set_visible_by_name(self.source_name, True)
-            case 'hide':
-                OBS2.sceneitem_set_visible_by_name(self.source_name, False)
+            # case 'show': #  TODO: remove
+            #     OBS2.sceneitem_set_visible_by_name(self.source_name, True)
+            # case 'hide':
+            #     OBS2.sceneitem_set_visible_by_name(self.source_name, False)
             case _:
                 debug('No BRB commands matched. Skipping.')
-
-    #----------------------------------------------------------------------
-    def update_buttons(self, props): # TODO: remove when start/stop buttons are removed.
-        p = S.obs_properties_get(props, 'start_button')
-        show_start = bool(not self.running and self.source_name)
-        debug('update_buttons %s start button' % ('showing' if show_start else 'hiding'))
-        S.obs_property_set_visible(p, show_start)
-
-        p = S.obs_properties_get(props, 'stop_button')
-        show_stop = bool(self.running and self.source_name)
-        debug('update_buttons %s stop button' % ('showing' if show_stop else 'hiding'))
-        S.obs_property_set_visible(p, show_stop)
 
     #----------------------------------------------------------------------
     def ticker(self):
         """
         Updates the text source contents. Scheduled as a per-second
         timer. Can only access running python state, not OBS settings or
-        props for this script.
+        props for this script. Can NOT be scheduled via obs.timer_add()
+        from a separate python thread (such as the irc client).
         """
-        debug('ticker called.')
-
         if self.hide_time > 0 and int(time.time()) > self.hide_time:
-            debug('hide_time reached, hiding ticker and removing self timer')
+            debug('hide_time reached, hiding on-screen text and removing timer')
             OBS2.sceneitem_set_visible_by_name(self.source_name, False)
-            OBS2.timer_remove(self.ticker)
+            #OBS2.timer_remove(self.ticker)
+            S.remove_current_callback()
             return
 
         OBS2.source_set_text_by_name(self.source_name, self.ticker_text())
-
-        debug(f"ticker complete.")
 
     #----------------------------------------------------------------------
     def ticker_text(self) -> str:
@@ -754,7 +684,10 @@ class Events:
         else:
             diff_secs: int = self.stop_time - self.start_time
 
-        dt: datetime.datetime = datetime.datetime.fromtimestamp(diff_secs, datetime.timezone.utc)
+        dt: datetime.datetime = datetime.datetime.fromtimestamp(
+            diff_secs,
+            datetime.timezone.utc,
+        )
         return dt.strftime('%M:%S')
 
     #----------------------------------------------------------------------
@@ -770,6 +703,7 @@ class Events:
 
             OBS2.source_set_text_by_name(self.source_name, self.ticker_text())
             #OBS2.timer_add(self.ticker, 1 * 1000) # TODO: This is causing a crash. But only when called from irc, not from on_start_button
+            #S.timer_add(ticker, 1 * 1000)
             OBS2.sceneitem_set_visible_by_name(self.source_name, True)
 
     #----------------------------------------------------------------------
@@ -823,10 +757,9 @@ class Events:
 
     #----------------------------------------------------------------------
     def _qualified_guesses(self) -> Dict[str, int]:
-        actual_secs = self.stop_time - self.start_time
-
         # Exclude any guess larger than the actual seconds. This may
         # be an empty set.
+        actual_secs = self.stop_time - self.start_time
         qualified = {
             username: seconds
             for username, seconds in self.guesses.items()
@@ -904,7 +837,7 @@ class Events:
             debug(f"User {msg.username} already has a guess registered: {existing_guess}")
             self.send_chat(MESSAGES.ALREADY_GUESSED(
                 user=msg.username,
-                guess=DT.strfdelta(existing_guess), # TODO: Format secs as MM:SS
+                guess=DT.strfdelta(existing_guess),
             ))
             return
 
@@ -912,7 +845,7 @@ class Events:
             debug(f"Guess registered for user {msg.username}: {delta}")
             self.send_chat(MESSAGES.GUESS_ACCEPTED(
                 user=msg.username,
-                guess=DT.strfdelta(delta), # TODO: Format secs as MM:SS
+                guess=DT.strfdelta(delta),
             ))
 
         debug("!at handled.")
@@ -947,15 +880,15 @@ class Events:
             debug(f"!brb winner is: {winner}")
             self.send_chat(MESSAGES.BRB_FINISHED(
                 streamer=self.user,
-                time=DT.strfdelta(actual_secs), # TODO: Format secs as MM:SS
+                time=DT.strfdelta(actual_secs),
                 winner=winner,
-                diff=DT.strfdelta(actual_secs - guess_secs), # TODO: Format secs as MM:SS
+                diff=DT.strfdelta(actual_secs - guess_secs),
             ))
         else:
             debug("No guesses, so no winner.")
             self.send_chat(MESSAGES.BRB_FINISHED_NO_GUESSES(
                 streamer=self.user,
-                time=DT.strfdelta(actual_secs), # TODO: Format secs as MM:SS
+                time=DT.strfdelta(actual_secs),
             ))
 
         debug("!back handled.")
@@ -964,52 +897,25 @@ class Events:
 ###########################################################################
 # Timers
 
+# =========================================================================
 type OBSTimer = Callable[[], None]
 
 class OBS2:
     #----------------------------------------------------------------------
     @classmethod
-    def timer_add(self, timer: OBSTimer, millisecs: int) -> OBSTimer:
+    def source_exists(self, source_name: str) -> bool:
         """
-        Creates a new global function named like the provided timer
-        function and adds that global function to OBS as a timer.
+        Returns True if a source with source_name is already present
+        in the currently active scene.
 
-        Usage:
-            OBS.timer_add(instance.my_func, millisecs)
+        Ref: https://github.com/upgradeQ/Streaming-Software-Scripting-Reference/blob/b876ee8e5/src/toggle_sceneitem_vis.py#L9-L13
         """
-        func_name = timer.__name__
-        if func_name in globals().keys():
-            raise ValueError(
-                "Can't shadow the provided timer. Global function "
-                f"already exists: {func_name}"
-            )
-
-        main = sys.modules[__name__]
-        setattr(main, func_name, dispatch(timer))
-        shadow = getattr(main, func_name)
-        S.timer_add(shadow, millisecs)
-        return shadow
-
-    #----------------------------------------------------------------------
-    @classmethod
-    def timer_remove(self, timer: OBSTimer, throw: bool = False) -> bool:
-        func_name = timer.__name__
-        if func_name not in globals().keys():
-            msg = str(
-                f"Can't remove the shadow for the provided timer: {timer} "
-                f"Global function doesn't exist: {func_name}"
-            )
-            if throw:
-                raise ValueError(msg)
-            else:
-                debug(msg)
-                return False
-
-        main = sys.modules[__name__]
-        shadow = getattr(main, func_name)
-        S.timer_remove(shadow)
-        delattr(main, func_name)
-        return True
+        scene_source = S.obs_frontend_get_current_scene() # Release!
+        scene = S.obs_scene_from_source(scene_source) # Don't release.
+        si = S.obs_scene_find_source(scene, source_name) # Don't release unless an explicit ref was saved.
+        if scene_source is not None:
+            S.obs_source_release(scene_source)
+        return (si is not None)
 
     #----------------------------------------------------------------------
     @classmethod
@@ -1043,7 +949,11 @@ class OBS2:
 #--------------------------------------------------------------------------
 def debug(msg: str):
     # Grab our frame and at most three parent frames.
-    stack = [f for f in inspect.stack(0) if f.frame.f_code.co_qualname not in ['dispatch.<locals>.handle']]
+    stack = [
+        f for f in inspect.stack(0)
+        if f.frame.f_code.co_qualname
+        not in ['dispatch.<locals>.handle']
+    ]
     callers_caller_frameinfo = stack[0:3][-1]
     calling_method = callers_caller_frameinfo.frame.f_code.co_qualname
     S.script_log(S.LOG_DEBUG, f"[{calling_method}] {msg}")
@@ -1068,9 +978,75 @@ irc_client: TwitchIRCClient = None
 # OBS Scripting API
 
 #--------------------------------------------------------------------------
-def script_description():
-    debug('script_description complete.')
-    return 'Testing modifying properties in realtime.'
+def script_description() -> str:
+    """
+    Describes the script in the OBS GUI.
+
+    Uses Qt formatting with a subset of HTML.
+
+    Ref: https://doc.qt.io/archives/qt-5.15/richtext-html-subset.html
+    Ref: (for raw svg) https://dashboard.twitch.tv/ > (Nav Menu) > Moderation > Inspect icon
+    Ref: (svg to data uri) https://codeshack.io/svg-to-data-uri-converter/
+    Ref: (color changer) https://www.svggenie.com/tools/svg-color-changer
+    """
+    mod_svg = dedent("""
+        <img src="data:image/svg+xml,%3Csvg width='18' height='18' viewBox='0 0 24 24'%3E%3Cpath fill='%23009900' fill-rule='evenodd' d='M15.504 2H22v6.496L10.35 17.35 12 19l-1.5 1.5-2.785-2.785L3.5 22 2 20.5l4.285-4.215L3.5 13.5 5 12l1.65 1.65L15.504 2ZM20 7.504 8.923 15.923l-.846-.846L16.496 4H20v3.504Z' clip-rule='evenodd'%3E%3C/path%3E%3C/svg%3E" alt="Broadcaster and mods only">
+    """.strip())
+
+    cell_style = 'style="background-color: #444444;"'
+
+    return dedent(f"""
+        <h3><a href="https://github.com/beporter/brb-timer">{SCRIPT_NAME}</a> v{SCRIPT_VERSION}</h3>
+
+        <p>Let chatters guess when the streamer will return from being AFK.<br></p>
+
+        <table cellpadding="3" width="100%">
+            <tr>
+                <td {cell_style} align="center">{mod_svg}</td>
+                <td {cell_style}><code>{COMMANDS.BRB}</code></td>
+                <td {cell_style}>Start the on-screen timer and allow guessing.</td>
+            </tr>
+            <tr>
+                <td {cell_style} align="center">&nbsp;</td>
+                <td {cell_style}><code>{COMMANDS.AT} MM:SS</code> &nbsp; </td>
+                <td {cell_style}>Chatter registers their guess.</td>
+            </tr>
+            <tr>
+                <td {cell_style} align="center">{mod_svg}</td>
+                <td {cell_style}><code>{COMMANDS.BACK}</code></td>
+                <td {cell_style}>Stop the timer and show the winner.</td>
+            </tr>
+        </table>
+
+        <!--
+        <p>The script requires Twitch API permission to look up your broadcaster (user) name, and channel name. Click the <b>Connect Twitch</b> button to start that process.</p>
+
+        <p>The script adds a text Source named <code>{DEFAULTS.TEXT_TIMER}</code> to your active Scene. Modify as desired, but <i>leave the name untouched</i>. Connects to your Twitch chat to listen for the BRB commands listed above.</p>
+        -->
+
+        <p><i>Originally written exclusively for <a href="https://www.twitch.tv/enns">Enns</a> by <a href="https://github.com/beporter">beporter</a> in August 2026.</i></p>
+    """.strip())
+
+#--------------------------------------------------------------------------
+def script_defaults(
+    settings, # obs_data_t
+): # -> obs_data_t
+    """
+    This lifecycle methods is called EARLY in the script's startup
+    process. Before `script_properties()` is even called for the first
+    time.
+    """
+    # S.obs_data_set_default_string(
+    #     settings,
+    #     "source_prop",
+    #     DEFAULTS.TEXT_TIMER,
+    # )
+
+    S.obs_data_set_default_int(
+        settings,
+        "auto_hide_secs",
+        DEFAULTS.AUTO_HIDE_SECS,
+    )
 
 #--------------------------------------------------------------------------
 def script_properties():
@@ -1086,25 +1062,7 @@ def script_properties():
     """
     props = S.obs_properties_create()
 
-    # Select text source list.
-    p = S.obs_properties_add_list( # TODO: replace with auto-create-source
-        props,
-        'source_prop',
-        "Text Source",
-        S.OBS_COMBO_TYPE_LIST,
-        S.OBS_COMBO_FORMAT_STRING,
-    )
-    S.obs_property_set_modified_callback(p, dispatch(e.on_list_modified))
-    sources = S.obs_enum_sources()
-    if sources is not None:
-        for source in sources:
-            source_id = S.obs_source_get_unversioned_id(source)
-            if source_id == "text_gdiplus" or source_id == "text_ft2_source":
-                name = S.obs_source_get_name(source)
-                S.obs_property_list_add_string(p, name, name)
-
-        S.source_list_release(sources)
-
+    # Connect Twitch button
     b = S.obs_properties_add_button(
         props,
         'twitch_connect_button',
@@ -1122,30 +1080,14 @@ def script_properties():
         ),
     )
 
+    # Twitch OAuth text input.
     t = S.obs_properties_add_text(
         props,
         'twitch_token',
         'Twitch OAuth Token',
         S.OBS_TEXT_PASSWORD,
     )
-    S.obs_property_set_modified_callback(t, dispatch(e.on_token_modified))
-
-    # Button to start the timer. (Use the built-in callback, not set_modified_callback)
-    start_button = S.obs_properties_add_button( # TODO: remove
-        props,
-        'start_button',
-        'Start timer',
-        dispatch(e.on_start_button),
-    )
-
-    # Button to stop the timer.
-    stop_button = S.obs_properties_add_button( # TODO: remove
-        props,
-        'stop_button',
-        'Stop timer',
-        dispatch(e.on_stop_button),
-    )
-    S.obs_property_set_visible(stop_button, False) # Hide until a valid text source is selected.
+    # S.obs_property_set_modified_callback(t, dispatch(e.on_token_modified))
 
     debug('script_properties complete.')
     return props
@@ -1161,6 +1103,12 @@ def script_load(settings):
     e.running = False
     debug(f"script_load importing source_name from settings.")
     e.source_name = S.obs_data_get_string(settings, 'source_prop')
+
+    S.obs_frontend_add_event_callback(dispatch(e.on_event))
+
+    # Start the ticker from the main python thread.
+    # (It will no-op unless a !brb is running.)
+    S.timer_add(e.ticker, 1 * 1000)
 
     # from inspect import getmembers, isfunction
     # obs_funcs = [x[0] for x in getmembers(S, isfunction)]
@@ -1219,10 +1167,6 @@ def script_update(settings):
         irc_client.start()
 
     debug('script_update complete.')
-
-#--------------------------------------------------------------------------
-def script_save(settings):
-    debug('script_save called.')
 
 #--------------------------------------------------------------------------
 def script_unload():
