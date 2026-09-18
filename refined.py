@@ -28,7 +28,6 @@ SCRIPT_VERSION = 1.0
 # =========================================================================
 class DEFAULTS:
     AUTO_HIDE_SECS = 120
-    BOT_NICK = 'BRBot'
     TEXT_TIMER = f"{SCRIPT_NAME} - Timer"
     TRANSITION_SHOW = f"{SCRIPT_NAME} - Show Transition"
     TRANSITION_HIDE = f"{SCRIPT_NAME} - Hide Transition"
@@ -667,6 +666,8 @@ class TwitchEventPubClient:
         Send a chat message through Twitch Helix.
 
         This is the EventSub/API equivalent of IRC PRIVMSG.
+
+        Ref: https://dev.twitch.tv/docs/api/reference/#send-chat-message
         """
         with self.send_lock:
             if not self.client_id or not self.bot_user_id:
@@ -682,8 +683,8 @@ class TwitchEventPubClient:
             resp = self._api_request(
                 "helix/chat/messages",
                 body={
-                    "broadcaster_id": self.channel_user_id,
-                    "sender_id": self.bot_user_id,
+                    "broadcaster_id": self.channel_user_id, # Broadcaster's channel
+                    "sender_id": self.bot_user_id, # Who you're posting as
                     "message": message,
                 },
             )
@@ -714,10 +715,6 @@ class TwitchEventPubClient:
             except ConnectionError as e:
                 debug(f"Connection error: {e!r}")
                 pass
-
-            # except Exception as e:
-            #     # if self.running:
-            #         debug(f"General exception: {e!r}")
 
             finally:
                 self._close_socket()
@@ -801,16 +798,17 @@ class TwitchEventPubClient:
             return False
 
         self.user = resp.get('login', '')
-        self.client_id = resp.get('client_id', None)
-        self.bot_user_id = resp.get('user_id', '')
-        self.channel_user_id = self.bot_user_id # Bot is always the streamer's id in their own channel.
+        self.client_id = resp.get('client_id', self.APP_CLIENT_ID)
         self.expires_in = resp.get('expires_in', None), # int seconds
+        self.channel_user_id = resp.get('user_id', '') # Channel is always the streamer's id...
+        self.bot_user_id = self.channel_user_id # ...posting as themselves.
 
-        if not self.client_id or not self.bot_user_id:
-            debug(
-                "Twitch OAuth validation did not return "
-                "client_id/user_id"
-            )
+        if (
+            not self.client_id
+            or not self.bot_user_id
+            or not self.channel_user_id
+        ):
+            debug("Twitch OAuth validation did not return client_id/user_id")
             return False
 
         return True
@@ -829,8 +827,8 @@ class TwitchEventPubClient:
             "type": "channel.chat.message",
             "version": "1",
             "condition": {
-                "broadcaster_user_id": self.channel_user_id,
-                "user_id": self.channel_user_id,
+                "broadcaster_user_id": self.channel_user_id, # Broadcaster's channel
+                "user_id": self.bot_user_id, # Who you're listening as
             },
             "transport": {
                 "method": "websocket",
@@ -1353,6 +1351,8 @@ class Events:
         Handler that's called when chat_client returns a ChatMessage with
         a !back command.
         """
+        global chat_client
+
         debug("Handling !back.")
         # Validate command was sent by broadcaster or nod.
         if not (msg.is_mod or msg.is_broadcaster):
@@ -1376,7 +1376,7 @@ class Events:
         if winner:
             debug(f"!brb winner is: {winner}")
             self.send_chat(MESSAGES.BRB_FINISHED(
-                streamer=self.user,
+                streamer=chat_client.user,
                 time=DT.strfdelta(actual_secs),
                 winner=winner,
                 diff=DT.strfdelta(actual_secs - guess_secs),
@@ -1455,14 +1455,7 @@ def debug(msg: str):
     calling_method = callers_caller_frameinfo.frame.f_code.co_qualname
     S.script_log(S.LOG_DEBUG, f"[{calling_method}] {msg}")
 
-#--------------------------------------------------------------------------
-def dispatch(callback: callable) -> callable:
-    S.script_log(S.LOG_DEBUG, f"Creating closure for {callback.__qualname__}")
-    def handle(*args, **kwargs):
-        S.script_log(S.LOG_DEBUG, f"Triggering {callback.__qualname__}")
-        return callback(*args, **kwargs)
-    return handle
-
+# TODO: Bring back info() and warn().
 
 ###########################################################################
 # Global State

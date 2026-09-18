@@ -1810,7 +1810,7 @@ class TwitchApi:
 
 class TwitchOAuth:
     """
-    Coordinates the entire OAuth implicit grant process against Twitch.
+    Coordinates the entire OAuth grant process against Twitch.
 
     - Generates the starting URL to be opened in the user's browser.
     - That URL sets up the necessary OAuth query args and the user
@@ -2081,22 +2081,6 @@ class TwitchIRCClient:
         # TODO: Take a pass through the entire script at narrowing all `except Exception` cases down to only the expected raises.
         except OSError as e:
             OBS.debug(f"Failed to wake IRC thread: {e!r}")
-
-        # try:
-        #     if self.socket is not None:
-        #         OBS.debug("Closing irc socket.")
-        #         self.socket.shutdown(socket.SHUT_RDWR)
-        #         self.socket.close()
-
-        #     if self.thread and self.thread.is_alive():
-        #         OBS.debug("Waiting for background thread.")
-        #         self.thread.join()
-
-        # except OSError:
-        #     pass
-
-        # except Exception as e:
-        #     OBS.debug(f"Failed to close socket: {e!r}")
 
     #----------------------------------------------------------------------
     def close(self):

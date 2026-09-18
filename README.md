@@ -318,6 +318,15 @@ OBS Scripting API call order:
 - `script_unload` (called once when OBS is terminating this script. Absolutely **every** source, scene, sceneitem, data, etc needs to be `obs_*_release()`d to prevent OBS from crashing and potentially wiping the user's configured scenes and sources. This applies ONLY to objects **created by this script**. Objects passed into this script's interface functions are released by OBS itself.)
 
 
+## Assets
+
+- [Twitch Bot Account @brbtimer](https://www.twitch.tv/brbtimer)
+- [User icon](docs/back-arrow-svgrepo-com.svg) (credit to [SVG Repo](https://www.svgrepo.com/svg/404761/back-arrow))
+- [Grants description](https://discuss.dev.twitch.com/t/getting-bot-user-id/64363/2)?
+    - (bot account `brbtimer` needs to authenticate against the app's client_id with `user:bot user:read:chat user:write:chat` scopes)
+    - (end user account `your_username_here` needs to auth against the app's client_id with `channel:bot` scopes)
+
+
 ## References
 
 https://pytwitchapi.dev/en/stable/index.html
