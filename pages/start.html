@@ -3,26 +3,36 @@
 <head>
     <meta charset="utf-8">
     <title>Twitch Authorization</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css">
 </head>
-<body>
+<body class="container mt-4">
     <!--
     - This page's public URL must be listed as an allowed redirect URL in
       the Twitch Developer Console.
     - This page (quietly) accepts query params to override the default
       form inputs for `client_id` and `scopes`.
     -->
-    <h2>Connect to Twitch</h2>
-    <form id="oauth" method="GET" action="https://id.twitch.tv/oauth2/authorize">
-        <input type="hidden" name="client_id" value="ja5swzyzsr1euwm0e53h1sxqhk553l">
-        <input type="hidden" name="response_type" value="token">
-        <input type="hidden" name="scope" value="chat:read chat:edit">
+    <div class="card">
+        <h2 class="card-header">Connect to Twitch</h2>
+        <form id="oauth" method="GET" action="https://id.twitch.tv/oauth2/authorize" class="card-body mt-3">
+            <input type="hidden" name="client_id" value="ja5swzyzsr1euwm0e53h1sxqhk553l">
+            <input type="hidden" name="response_type" value="token">
+            <input type="hidden" name="scope" value="user:read:chat user:write:chat user:bot channel:bot chat:read chat:edit">
 
-        <input type="hidden" name="redirect_uri" value="__auto_populated__">
-        <input type="hidden" name="state" value="__auto_populated__">
+            <input type="hidden" name="redirect_uri" value="__auto_populated__">
+            <input type="hidden" name="state" value="__auto_populated__">
 
-        <button type="submit">Connect to Twitch</button>
-    </form>
-    <p id="status"></p>
+            <div class="d-grid gap-2 col-6 mx-auto">
+                <button type="submit" class="btn btn-primary btn-lg text-nowrap">Connect to Twitch</button>
+            </div>
+        </form>
+        <p id="status"></p>
+    </div>
+
+    <footer class="text-secondary text-center mt-2">
+        <em>Part of <a href="https://github.com/beporter/brb-timer">BRB Timer</a> by <a href="https://github.com/beporter">@beporter</a></em>
+    </footer>
 
     <script>
     (async function() {
@@ -71,5 +81,8 @@
         }
     })();
     </script>
+    <noscript>
+        Javascript is not available. Any query params in the address bar have been ignored.
+    </noscript>
 </body>
 </html>
