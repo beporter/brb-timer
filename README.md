@@ -8,6 +8,8 @@ Exposes some chat commands for mods and chatters to use:
 - `!at MM:SS` - Lets chatters guess when the streamer will return.
 - `!back` - Lets mods end an active `!brb` and sends a chat message stating the "winner".
 
+TODO: Overhaul this doc to match refined.py operation.
+
 
 ## Installation
 

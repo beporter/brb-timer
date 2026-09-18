@@ -1,5 +1,5 @@
 """
-Minimal implementation of BRB Timer, starting from working timer example in simple.py.
+'Minimal' implementation of BRB Timer, starting from working timer example in simple.py.
 """
 from __future__ import annotations
 import base64
@@ -11,7 +11,6 @@ import inspect
 import json
 import os
 import re
-import select
 import socket
 import ssl
 import struct
@@ -186,6 +185,8 @@ class _WebSocket:
     Minimal RFC6455 WebSocket client implemented with only the
     Python standard library.
     """
+    MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
     #----------------------------------------------------------------------
     def __init__(self, url: str, timeout: float = 10):
         self.url = url
@@ -234,41 +235,60 @@ class _WebSocket:
         ).encode("ascii")
         self.socket.sendall(request)
 
-        response = self._read_http_response()
-        status_line, headers = response
+        status_line, headers = self._read_http_response()
         try:
             version, status, reason = status_line.split(" ", 2)
-        except ValueError:
+        except ValueError as e:
             raise ConnectionError(
                 f"Invalid WebSocket HTTP response: {status_line!r}"
+            ) from e
+
+        if version != "HTTP/1.1":
+            raise ConnectionError(
+                f"Unexpected WebSocket HTTP version: {version!r}"
             )
 
         if status != "101":
             raise ConnectionError(
-                f"WebSocket handshake failed: "
-                f"{status} {reason}"
+                f"WebSocket handshake failed: {status} {reason}"
+            )
+
+        if headers.get("upgrade", "").lower() != "websocket":
+            raise ConnectionError(
+                "WebSocket handshake missing Upgrade: websocket"
+            )
+
+        connection_tokens = {
+            token.strip().lower()
+            for token in headers.get("connection", "").split(",")
+        }
+        if "upgrade" not in connection_tokens:
+            raise ConnectionError(
+                "WebSocket handshake missing Connection: Upgrade"
             )
 
         accept = headers.get("sec-websocket-accept")
-        if not accept:
+        if accept is None:
             raise ConnectionError(
                 "WebSocket handshake missing Sec-WebSocket-Accept"
             )
 
-        expected = base64.b64encode(
+        expected_accept = base64.b64encode(
             hashlib.sha1(
-                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+                (key + self.MAGIC).encode("ascii")
             ).digest()
         ).decode("ascii")
 
-        if accept.strip() != expected:
+        if accept.strip() != expected_accept:
             raise ConnectionError(
                 "Invalid WebSocket Sec-WebSocket-Accept"
             )
 
-        # WebSocket frames need short periodic timeouts so the caller can
-        # notice stop_event without needing to close the socket from another
-        # thread.
+        if "sec-websocket-extensions" in headers:
+            raise ConnectionError(
+                "WebSocket extensions are not supported"
+            )
+
         self.socket.settimeout(1.0)
 
     #----------------------------------------------------------------------
@@ -282,14 +302,9 @@ class _WebSocket:
             None  for a clean WebSocket close
         """
         while True:
-            try:
-                frame = self._recv_frame()
-            except socket.timeout:
-                raise
+            fin, opcode, payload = self._recv_frame()
 
-            fin, opcode, payload = frame
-
-            # Continuation frames.
+            # Continuation frame.
             if opcode == 0x0:
                 if self._fragment_opcode is None:
                     raise ConnectionError(
@@ -314,19 +329,18 @@ class _WebSocket:
                     f"Invalid fragmented opcode: {message_opcode}"
                 )
 
-            # Text.
-            if opcode == 0x1:
-                if fin:
-                    return payload.decode("utf-8")
+            # Text or binary data frame.
+            if opcode in (0x1, 0x2):
+                if self._fragment_opcode is not None:
+                    raise ConnectionError(
+                        "New WebSocket data frame received "
+                        "during fragmented message"
+                    )
 
-                self._fragment_opcode = opcode
-                self._fragment_buffer.clear()
-                self._fragment_buffer.extend(payload)
-                continue
-
-            # Binary.
-            if opcode == 0x2:
                 if fin:
+                    if opcode == 0x1:
+                        return payload.decode("utf-8")
+
                     return payload
 
                 self._fragment_opcode = opcode
@@ -336,15 +350,19 @@ class _WebSocket:
 
             # Close.
             if opcode == 0x8:
-                self._send_close(payload)
-                if len(payload) >= 2:
-                    code = struct.unpack("!H", payload[:2])[0]
+                if len(payload) == 1:
                     raise ConnectionError(
-                        f"WebSocket closed by server "
-                        f"(code {code})"
+                        "WebSocket close frame has invalid payload length"
                     )
 
-                return None
+                self._send_close(payload)
+                if len(payload) >= 2:
+                    close_code = struct.unpack("!H", payload[:2])[0]
+                    raise ConnectionError(
+                        f"WebSocket closed by server (code {close_code})"
+                    )
+
+                raise ConnectionError("WebSocket closed by server")
 
             # Ping.
             if opcode == 0x9:
@@ -362,26 +380,31 @@ class _WebSocket:
     #----------------------------------------------------------------------
     def close(self) -> None:
         sock = self.socket
-        self.socket = None
         if sock is None:
             return
 
         try:
             self._send_close(struct.pack("!H", 1000))
-        except Exception:
+        except (OSError, ValueError):
             pass
+        finally:
+            self.socket = None
 
-        try:
-            sock.close()
-        except OSError:
-            pass
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     #----------------------------------------------------------------------
     def _read_http_response(self) -> tuple[str, dict[str, str]]:
         data = bytearray()
 
         while b"\r\n\r\n" not in data:
-            chunk = self._recv_exact_or_timeout(4096)
+            try:
+                chunk = self._recv_socket(4096)
+            except socket.timeout:
+                continue
+
             if not chunk:
                 raise ConnectionError(
                     "EOF during WebSocket handshake"
@@ -390,7 +413,7 @@ class _WebSocket:
             data.extend(chunk)
             if len(data) > 64 * 1024:
                 raise ConnectionError(
-                    "WebSocket handshake response too large"
+                    "WebSocket handshake response exceeds 64 KiB"
                 )
 
         header_bytes, remainder = data.split(b"\r\n\r\n", 1)
@@ -398,15 +421,20 @@ class _WebSocket:
         # Preserve anything that happened to arrive after the HTTP headers.
         self._recv_buffer.extend(remainder)
         lines = header_bytes.decode("iso-8859-1").split("\r\n")
-        if not lines:
+        if not lines or not lines[0]:
             raise ConnectionError(
                 "Empty WebSocket handshake response"
             )
 
         headers: dict[str, str] = {}
         for line in lines[1:]:
-            if ":" not in line:
+            if not line:
                 continue
+
+            if ":" not in line:
+                raise ConnectionError(
+                    f"Malformed WebSocket HTTP header: {line!r}"
+                )
 
             name, value = line.split(":", 1)
             headers[name.strip().lower()] = value.strip()
@@ -419,14 +447,12 @@ class _WebSocket:
         first = first_two[0]
         second = first_two[1]
         fin = bool(first & 0x80)
-        rsv = first & 0x70
-        opcode = first & 0x0F
-        if rsv:
+        if first & 0x70:
             raise ConnectionError(
-                "WebSocket extensions are not supported"
+                "WebSocket frame uses unsupported RSV bits"
             )
 
-        # Server-to-client frames must not be masked.
+        opcode = first & 0x0F
         masked = bool(second & 0x80)
         length = second & 0x7F
         if masked:
@@ -438,13 +464,12 @@ class _WebSocket:
             length = struct.unpack("!H", self._recv_exact(2))[0]
         elif length == 127:
             length = struct.unpack("!Q", self._recv_exact(8))[0]
-            if length > 2**63 - 1:
+            if length & (1 << 63):
                 raise ConnectionError(
-                    "Invalid WebSocket frame length"
+                    "Invalid WebSocket 64-bit frame length"
                 )
 
-        # Control frames cannot be fragmented and have a max payload
-        # length of 125 bytes.
+        # Control frames must be final and <= 125 bytes.
         if opcode >= 0x8:
             if not fin:
                 raise ConnectionError(
@@ -453,32 +478,35 @@ class _WebSocket:
 
             if length > 125:
                 raise ConnectionError(
-                    "Oversized WebSocket control frame"
+                    "WebSocket control frame exceeds "
+                    "125-byte limit"
                 )
 
-        payload = self._recv_exact(length)
+        # Continuation frames require an active fragmented message.
+        if opcode == 0x0 and self._fragment_opcode is None:
+            raise ConnectionError(
+                "Unexpected WebSocket continuation frame"
+            )
 
+        # Reject undefined control opcodes.
+        if opcode >= 0x8 and opcode not in (
+            0x8,  # Close
+            0x9,  # Ping
+            0xA,  # Pong
+        ):
+            raise ConnectionError(
+                f"Unknown WebSocket control opcode: {opcode}"
+            )
+
+        payload = self._recv_exact(length)
         return fin, opcode, payload
 
     #----------------------------------------------------------------------
     def _recv_exact(self, size: int) -> bytes:
-        while True:
-            try:
-                return self._recv_exact_or_timeout(size)
-            except socket.timeout:
-                raise
-
-    #----------------------------------------------------------------------
-    def _recv_exact_or_timeout(self, size: int) -> bytes:
-        if self.socket is None:
-            raise ConnectionError("WebSocket is not connected")
-
         while len(self._recv_buffer) < size:
-            try:
-                chunk = self.socket.recv(max(4096, size - len(self._recv_buffer)))
-            except socket.timeout:
-                raise
-
+            chunk = self._recv_socket(
+                max(4096, size - len(self._recv_buffer))
+            )
             if not chunk:
                 raise ConnectionError("WebSocket EOF")
 
@@ -490,18 +518,42 @@ class _WebSocket:
         return result
 
     #----------------------------------------------------------------------
+    def _recv_socket(self, size: int) -> bytes:
+        if self.socket is None:
+            raise ConnectionError("WebSocket is not connected")
+
+        return self.socket.recv(size)
+
+    #----------------------------------------------------------------------
     def _send_close(self, payload: bytes = b"") -> None:
+        if len(payload) == 1:
+            raise ValueError(
+                "WebSocket close payload cannot have length 1"
+            )
+
+        if len(payload) > 125:
+            raise ValueError(
+                "WebSocket close payload exceeds "
+                "125-byte control-frame limit"
+            )
+
         try:
             self._send_frame(0x8, payload)
-        except Exception:
-            pass
+        except OSError:
+            pass # The peer may already have closed the TCP connection.
 
     #----------------------------------------------------------------------
     def _send_frame(self, opcode: int, payload: bytes = b"") -> None:
         if self.socket is None:
             raise ConnectionError("WebSocket is not connected")
 
-        # All client-to-server frames MUST be masked.
+        if opcode >= 0x8 and len(payload) > 125:
+            raise ValueError(
+                "WebSocket control frame payload "
+                "cannot exceed 125 bytes"
+            )
+
+        # RFC 6455 requires client-to-server frames to be masked.
         mask = os.urandom(4)
         length = len(payload)
         if length < 126:
@@ -564,7 +616,7 @@ class TwitchEventPubClient:
         self.thread: threading.Thread = None
         self.stop_event: threading.Event = threading.Event()
 
-        self.client_id: str = ''
+        self.client_id: str = self.APP_CLIENT_ID
         self.user: str = ''
         self.bot_user_id: int = None # ID of bot connecting to channel.
         self.channel_user_id = None # ID of channel's owner.
@@ -578,9 +630,8 @@ class TwitchEventPubClient:
 
         self.running = True
         self.stop_event.clear()
-
         self.thread = threading.Thread(
-            target=self._receive_loop,
+            target=self._receive_loop_thread,
             daemon=True,
             name=f"{SCRIPT_NAME}-TwitchEventSub",
         )
@@ -596,14 +647,11 @@ class TwitchEventPubClient:
         """
         self.stop()
 
-        thread = self.thread
-        if thread is not None and thread is not threading.current_thread():
-            try:
-                thread.join(timeout=2)
-            except Exception as e:
-                debug(
-                    f"Failed joining Twitch EventSub thread: {e!r}"
-                )
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(timeout=2)
+            if self.thread.is_alive():
+                debug(f"Failed joining Twitch EventSub thread.")
+                raise
 
         self.thread = None
         debug("Twitch EventSub client shut down.")
@@ -612,14 +660,6 @@ class TwitchEventPubClient:
     def stop(self) -> None:
         self.running = False
         self.stop_event.set()
-
-        # Closing the socket wakes the receive thread if it is blocked in
-        # recv(). The receiver thread remains responsible for final cleanup.
-        if self.socket is not None:
-            try:
-                self.socket.close()
-            except Exception:
-                pass
 
     #----------------------------------------------------------------------
     def send_chat(self, message: str) -> None:
@@ -639,58 +679,50 @@ class TwitchEventPubClient:
                     "Twitch channel identity is unavailable"
                 )
 
-            body = {
-                "broadcaster_id": self.channel_user_id,
-                "sender_id": self.bot_user_id,
-                "message": message,
-            }
-
-            status, response = self._api_request(
+            resp = self._api_request(
                 "helix/chat/messages",
-                body=body,
+                body={
+                    "broadcaster_id": self.channel_user_id,
+                    "sender_id": self.bot_user_id,
+                    "message": message,
+                },
             )
-
-            if not 200 <= status < 300:
+            if not resp:
                 raise ConnectionError(
-                    "Twitch Send Chat Message failed: "
-                    f"HTTP {status}: {response!r}"
+                    "Twitch Send Chat Message failed"
                 )
 
-            try:
-                result = json.loads(response)
-            except json.JSONDecodeError:
-                raise ConnectionError(
-                    f"Invalid Twitch response: {response!r}"
-                )
-
-            data = result.get("data") or []
+            data = resp.get("data", [])[0]
             if not data:
                 raise ConnectionError(
-                    f"Twitch returned no chat result: {result!r}"
+                    f"Twitch returned no chat result."
                 )
 
-            result = data[0]
-            if not result.get("is_sent"):
+            if not data.get("is_sent"):
                 raise ConnectionError(
                     "Twitch rejected chat message: "
-                    f"{result.get('drop_reason')!r}"
+                    f"{data.get('drop_reason')!r}"
                 )
 
     #----------------------------------------------------------------------
-    def _receive_loop(self) -> None:
+    def _receive_loop_thread(self) -> None:
         while self.running:
             try:
                 self._connect()
                 self._read_loop()
 
-            except Exception as e:
-                if self.running:
-                    debug(f"Twitch EventSub Listener: {e!r}")
+            except ConnectionError as e:
+                debug(f"Connection error: {e!r}")
+                pass
+
+            # except Exception as e:
+            #     # if self.running:
+            #         debug(f"General exception: {e!r}")
 
             finally:
                 self._close_socket()
 
-            if self.running:
+            if self.running: # Pause if we're looping.
                 self._wait_for_reconnect()
 
     #----------------------------------------------------------------------
@@ -698,7 +730,9 @@ class TwitchEventPubClient:
         """
         Create a fresh EventSub WebSocket session.
         """
-        self._initialize_identity()
+        if not self._initialize_identity():
+            self.running = False
+            return
 
         ws = _WebSocket(self.EVENTSUB_URL, timeout=self.CONNECT_TIMEOUT)
         ws.connect()
@@ -706,23 +740,17 @@ class TwitchEventPubClient:
 
         raw = ws.recv_message()
         if raw is None:
-            raise ConnectionError(
-                "EventSub closed during welcome"
-            )
+            raise ConnectionError("EventSub closed during welcome")
 
         if not isinstance(raw, str):
-            raise ConnectionError(
-                "EventSub welcome was not a text frame"
-            )
+            raise ConnectionError("EventSub welcome was not a text frame")
 
         try:
             welcome = json.loads(raw)
         except json.JSONDecodeError as e:
-            raise ConnectionError(
-                f"Invalid EventSub welcome: {e}"
-            )
+            raise ConnectionError(f"Invalid EventSub welcome: {e}")
 
-        metadata = welcome.get("metadata") or {}
+        metadata = welcome.get("metadata", {})
         if metadata.get("message_type") != "session_welcome":
             raise ConnectionError(
                 "Expected EventSub session_welcome, got "
@@ -779,10 +807,13 @@ class TwitchEventPubClient:
         self.expires_in = resp.get('expires_in', None), # int seconds
 
         if not self.client_id or not self.bot_user_id:
-            raise ConnectionError(
+            debug(
                 "Twitch OAuth validation did not return "
                 "client_id/user_id"
             )
+            return False
+
+        return True
 
     #----------------------------------------------------------------------
     def _create_chat_subscription(
@@ -807,7 +838,7 @@ class TwitchEventPubClient:
             },
         }
 
-        resp = self._api_request('eventsub/subscriptions', body=body)
+        resp = self._api_request('helix/eventsub/subscriptions', body=body)
         if not resp:
             raise ConnectionError(
                 "Failed to create Twitch EventSub subscription."
@@ -816,31 +847,22 @@ class TwitchEventPubClient:
     #----------------------------------------------------------------------
     def _read_loop(self) -> None:
         if self.socket is None:
-            raise ConnectionError(
-                "EventSub WebSocket is not connected"
-            )
+            raise ConnectionError("EventSub WebSocket is not connected")
 
-        last_event = time.monotonic()
         while self.running:
             try:
                 raw = self.socket.recv_message()
 
             except socket.timeout:
-                # WebSocket ping/pong is handled internally by
-                # _WebSocket.recv_message(). This timeout is only here so
-                # that stop() can be observed.
+                # The 1-second socket timeout exists solely to make stop()
+                # responsive. It is not a connection failure.
                 if not self.running:
                     return
 
-                if (time.monotonic() - last_event > self.keepalive_timeout):
-                    raise ConnectionError("EventSub keepalive timeout")
-
                 continue
 
-            if raw is None:
-                raise ConnectionError(
-                    "EventSub WebSocket EOF"
-                )
+            if not self.running:
+                return
 
             if not isinstance(raw, str):
                 continue
@@ -848,31 +870,17 @@ class TwitchEventPubClient:
             try:
                 message = json.loads(raw)
             except json.JSONDecodeError as e:
-                debug(
-                    f"Ignoring invalid EventSub JSON: {e!r}"
-                )
+                debug(f"Ignoring invalid EventSub JSON: {e!r}")
                 continue
 
-            message_type = (message.get("metadata", {}).get("message_type"))
-
-            # Both notification and keepalive reset the EventSub
-            # keepalive timer.
-            if message_type in (
-                "notification",
-                "session_keepalive",
-            ):
-                last_event = time.monotonic()
-
+            message_type = message.get("metadata", {}).get("message_type")
             if message_type == "notification":
                 self._handle_notification(message)
-
             elif message_type == "session_keepalive":
                 continue
-
             elif message_type == "session_reconnect":
                 self._handle_reconnect(message)
                 return
-
             elif message_type == "revocation":
                 self._handle_revocation(message)
                 return
@@ -964,9 +972,14 @@ class TwitchEventPubClient:
 
             debug("Twitch EventSub reconnect completed.")
 
-        except Exception:
+        except (
+            OSError,
+            BlockingIOError,
+            ConnectionError,
+            TimeoutError,
+        ) as e:
+            debug(f"reconnect failure: {e!r}")
             new_ws.close()
-            raise
 
     #----------------------------------------------------------------------
     def _handle_revocation(self, message: dict) -> None:
@@ -996,7 +1009,7 @@ class TwitchEventPubClient:
         if ws is not None:
             try:
                 ws.close()
-            except Exception:
+            except OSError:
                 pass
 
     #----------------------------------------------------------------------
@@ -1004,14 +1017,9 @@ class TwitchEventPubClient:
         self,
         path: str,
         body: dict|None = None,
-        params: dict|None = None,
-        extra_headers: Dict[str, str|int] = {},
+        params: dict[str, str|int] = {},
+        extra_headers: dict[str, str|int] = {},
     ) -> object|False:
-        if not self.client_id:
-            raise ConnectionError(
-                "Twitch client ID is unavailable"
-            )
-
         data = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")
@@ -1024,12 +1032,13 @@ class TwitchEventPubClient:
         )
 
         try:
-            with request.urlopen(
-                req,
-                timeout=TwitchEventPubClient.HTTP_TIMEOUT,
-            ) as r:
-                return json.load(e.fp)
+            with request.urlopen(req, timeout=self.HTTP_TIMEOUT) as r:
+                return json.load(r)
 
+        except json.JSONDecodeError:
+            detail = f"Invalid JSON payload: {r!r}"
+        except UnicodeDecodeError:
+            detail = f"Non-unicode payload: {r!r}"
         except error.HTTPError as e:
             match e.code:
                 case http.HTTPStatus.UNAUTHORIZED:
@@ -1054,8 +1063,7 @@ class TwitchEventPubClient:
                 case _:
                     detail = e.reason
 
-            debug(detail)
-
+        debug(f"_api_request failure: {detail}")
         return False
 
     #----------------------------------------------------------------------
@@ -1071,12 +1079,18 @@ class TwitchEventPubClient:
         self,
         extra: dict[str, str|int] = {},
     ) -> dict[str, str|int]:
+        if (
+            'client-id' not in map(str.lower, extra.keys())
+            and len(self.client_id) > 0
+        ):
+            extra['Client-ID'] = self.client_id
+
         return {
             'User-Agent': f"{SCRIPT_NAME} v{SCRIPT_VERSION}",
             'Accept': 'application/json',
             'Authorization': f"Bearer {self.oauth}",
-            'Client-ID': self.client_id,
-        } | extra
+            **extra,
+        }
 
 
 ###########################################################################
@@ -1091,10 +1105,7 @@ class Events:
     auto_hide_secs: int = DEFAULTS.AUTO_HIDE_SECS
     hide_time: int = 0
     guesses: dict[str, int] = {}
-
     token: str = ''
-    channel: str = ''
-    user: str = ''
 
     #----------------------------------------------------------------------
     def on_event(self, event):
@@ -1114,7 +1125,7 @@ class Events:
         Invoked by the IRC client whenever a chat message is received.
 
         This router is only responsible for determining whether to
-        respond to an event and dispatching it, or ignore it.
+        respond to an event and routing it to a handler, or ignore it.
         """
         match message.message.split()[0]:
             case COMMANDS.BRB:
@@ -1371,7 +1382,7 @@ class Events:
                 diff=DT.strfdelta(actual_secs - guess_secs),
             ))
         else:
-            debug("No guesses, so no winner.")
+            debug("No (valid) guesses, so no winner.")
             self.send_chat(MESSAGES.BRB_FINISHED_NO_GUESSES(
                 streamer=self.user,
                 time=DT.strfdelta(actual_secs),
@@ -1581,19 +1592,12 @@ def script_load(settings):
     """
     debug(f"script_load setting running = False.")
     e.running = False
-    debug(f"script_load importing source_name from settings.")
 
-    S.obs_frontend_add_event_callback(dispatch(e.on_event))
+    S.obs_frontend_add_event_callback(lambda ev: e.on_event(ev))
 
     # Start the ticker from the main python thread.
     # (It will no-op unless a !brb is running.)
     S.timer_add(e.ticker, 1 * 1000)
-
-    # from inspect import getmembers, isfunction
-    # obs_funcs = [x[0] for x in getmembers(S, isfunction)]
-    # for i in range(0, len(obs_funcs), 20):
-    #     print(obs_funcs[i:i+20])
-    # print(dict(getmembers(sys.modules[__name__], isfunction)).keys())
 
     debug(f"script_load complete.")
 
@@ -1618,17 +1622,17 @@ def script_update(settings):
     ):
         e.token = new_token
         if chat_client is not None:
+            debug('Closing old chat client.')
             chat_client.close()
             chat_client = None
 
-    if (
-        len(e.token) > 0
-        and len(e.user) > 0
-        and len(e.channel) > 0
-        and chat_client is None
-    ):
+    if len(e.token) > 0:
+        debug('Starting new chat client.')
         chat_client = TwitchEventPubClient(e.token, e.on_chat)
         chat_client.start()
+        if chat_client.running:
+            debug(f"Setting username: {chat_client.user}")
+            e.user = chat_client.user
 
     debug('script_update complete.')
 
