@@ -2,15 +2,19 @@
 Minimal implementation of BRB Timer, starting from working timer example in simple.py.
 """
 from __future__ import annotations
+import base64
 from dataclasses import dataclass
 import datetime
+import hashlib
 import http
 import inspect
 import json
+import os
 import re
 import select
 import socket
 import ssl
+import struct
 from textwrap import dedent
 import threading
 import time
@@ -25,6 +29,7 @@ SCRIPT_VERSION = 1.0
 # =========================================================================
 class DEFAULTS:
     AUTO_HIDE_SECS = 120
+    BOT_NICK = 'BRBot'
     TEXT_TIMER = f"{SCRIPT_NAME} - Timer"
     TRANSITION_SHOW = f"{SCRIPT_NAME} - Show Transition"
     TRANSITION_HIDE = f"{SCRIPT_NAME} - Hide Transition"
@@ -158,36 +163,599 @@ class DT:
 
 
 ###########################################################################
-# Twitch IRC Client
+# Twitch Chat Client
 
 # =========================================================================
-class TwitchApi:
+@dataclass
+class ChatMessage(object):
     """
-    Encapsulate http calls to Twitch's APIs.
+    Message passing container from the IRC client to the command parser.
+    """
+    username: str
+    display_name: str
+    message: str
+    is_mod: bool
+    is_broadcaster: bool
+
+# =========================================================================
+type ChatMsgCallback = Callable[[ChatMessage], None]
+
+# =========================================================================
+class _WebSocket:
+    """
+    Minimal RFC6455 WebSocket client implemented with only the
+    Python standard library.
+    """
+    #----------------------------------------------------------------------
+    def __init__(self, url: str, timeout: float = 10):
+        self.url = url
+        self.timeout = timeout
+        self.socket: socket.socket | ssl.SSLSocket | None = None
+
+        self._recv_buffer = bytearray()
+        self._fragment_buffer = bytearray()
+        self._fragment_opcode: int | None = None
+
+    #----------------------------------------------------------------------
+    def connect(self) -> None:
+        parsed = parse.urlsplit(self.url)
+        if parsed.scheme != "wss":
+            raise ValueError(
+                f"Only wss:// URLs are supported: {self.url!r}"
+            )
+
+        host = parsed.hostname
+        if not host:
+            raise ValueError(f"Invalid WebSocket URL: {self.url!r}")
+
+        port = parsed.port or 443
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+
+        self.socket = ssl.create_default_context().wrap_socket(
+            socket.create_connection(
+                (host, port),
+                timeout=self.timeout,
+            ),
+            server_hostname=host,
+        )
+
+        # RFC 6455 opening handshake.
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        ).encode("ascii")
+        self.socket.sendall(request)
+
+        response = self._read_http_response()
+        status_line, headers = response
+        try:
+            version, status, reason = status_line.split(" ", 2)
+        except ValueError:
+            raise ConnectionError(
+                f"Invalid WebSocket HTTP response: {status_line!r}"
+            )
+
+        if status != "101":
+            raise ConnectionError(
+                f"WebSocket handshake failed: "
+                f"{status} {reason}"
+            )
+
+        accept = headers.get("sec-websocket-accept")
+        if not accept:
+            raise ConnectionError(
+                "WebSocket handshake missing Sec-WebSocket-Accept"
+            )
+
+        expected = base64.b64encode(
+            hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+            ).digest()
+        ).decode("ascii")
+
+        if accept.strip() != expected:
+            raise ConnectionError(
+                "Invalid WebSocket Sec-WebSocket-Accept"
+            )
+
+        # WebSocket frames need short periodic timeouts so the caller can
+        # notice stop_event without needing to close the socket from another
+        # thread.
+        self.socket.settimeout(1.0)
+
+    #----------------------------------------------------------------------
+    def recv_message(self) -> str | bytes | None:
+        """
+        Receive the next complete WebSocket message.
+
+        Returns:
+            str   for text messages
+            bytes for binary messages
+            None  for a clean WebSocket close
+        """
+        while True:
+            try:
+                frame = self._recv_frame()
+            except socket.timeout:
+                raise
+
+            fin, opcode, payload = frame
+
+            # Continuation frames.
+            if opcode == 0x0:
+                if self._fragment_opcode is None:
+                    raise ConnectionError(
+                        "Unexpected WebSocket continuation frame"
+                    )
+
+                self._fragment_buffer.extend(payload)
+                if not fin:
+                    continue
+
+                message_opcode = self._fragment_opcode
+                data = bytes(self._fragment_buffer)
+                self._fragment_buffer.clear()
+                self._fragment_opcode = None
+                if message_opcode == 0x1:
+                    return data.decode("utf-8")
+
+                if message_opcode == 0x2:
+                    return data
+
+                raise ConnectionError(
+                    f"Invalid fragmented opcode: {message_opcode}"
+                )
+
+            # Text.
+            if opcode == 0x1:
+                if fin:
+                    return payload.decode("utf-8")
+
+                self._fragment_opcode = opcode
+                self._fragment_buffer.clear()
+                self._fragment_buffer.extend(payload)
+                continue
+
+            # Binary.
+            if opcode == 0x2:
+                if fin:
+                    return payload
+
+                self._fragment_opcode = opcode
+                self._fragment_buffer.clear()
+                self._fragment_buffer.extend(payload)
+                continue
+
+            # Close.
+            if opcode == 0x8:
+                self._send_close(payload)
+                if len(payload) >= 2:
+                    code = struct.unpack("!H", payload[:2])[0]
+                    raise ConnectionError(
+                        f"WebSocket closed by server "
+                        f"(code {code})"
+                    )
+
+                return None
+
+            # Ping.
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+                continue
+
+            # Pong.
+            if opcode == 0xA:
+                continue
+
+            raise ConnectionError(
+                f"Unsupported WebSocket opcode: {opcode}"
+            )
+
+    #----------------------------------------------------------------------
+    def close(self) -> None:
+        sock = self.socket
+        self.socket = None
+        if sock is None:
+            return
+
+        try:
+            self._send_close(struct.pack("!H", 1000))
+        except Exception:
+            pass
+
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    #----------------------------------------------------------------------
+    def _read_http_response(self) -> tuple[str, dict[str, str]]:
+        data = bytearray()
+
+        while b"\r\n\r\n" not in data:
+            chunk = self._recv_exact_or_timeout(4096)
+            if not chunk:
+                raise ConnectionError(
+                    "EOF during WebSocket handshake"
+                )
+
+            data.extend(chunk)
+            if len(data) > 64 * 1024:
+                raise ConnectionError(
+                    "WebSocket handshake response too large"
+                )
+
+        header_bytes, remainder = data.split(b"\r\n\r\n", 1)
+
+        # Preserve anything that happened to arrive after the HTTP headers.
+        self._recv_buffer.extend(remainder)
+        lines = header_bytes.decode("iso-8859-1").split("\r\n")
+        if not lines:
+            raise ConnectionError(
+                "Empty WebSocket handshake response"
+            )
+
+        headers: dict[str, str] = {}
+        for line in lines[1:]:
+            if ":" not in line:
+                continue
+
+            name, value = line.split(":", 1)
+            headers[name.strip().lower()] = value.strip()
+
+        return lines[0], headers
+
+    #----------------------------------------------------------------------
+    def _recv_frame(self) -> tuple[bool, int, bytes]:
+        first_two = self._recv_exact(2)
+        first = first_two[0]
+        second = first_two[1]
+        fin = bool(first & 0x80)
+        rsv = first & 0x70
+        opcode = first & 0x0F
+        if rsv:
+            raise ConnectionError(
+                "WebSocket extensions are not supported"
+            )
+
+        # Server-to-client frames must not be masked.
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        if masked:
+            raise ConnectionError(
+                "Server sent a masked WebSocket frame"
+            )
+
+        if length == 126:
+            length = struct.unpack("!H", self._recv_exact(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._recv_exact(8))[0]
+            if length > 2**63 - 1:
+                raise ConnectionError(
+                    "Invalid WebSocket frame length"
+                )
+
+        # Control frames cannot be fragmented and have a max payload
+        # length of 125 bytes.
+        if opcode >= 0x8:
+            if not fin:
+                raise ConnectionError(
+                    "Fragmented WebSocket control frame"
+                )
+
+            if length > 125:
+                raise ConnectionError(
+                    "Oversized WebSocket control frame"
+                )
+
+        payload = self._recv_exact(length)
+
+        return fin, opcode, payload
+
+    #----------------------------------------------------------------------
+    def _recv_exact(self, size: int) -> bytes:
+        while True:
+            try:
+                return self._recv_exact_or_timeout(size)
+            except socket.timeout:
+                raise
+
+    #----------------------------------------------------------------------
+    def _recv_exact_or_timeout(self, size: int) -> bytes:
+        if self.socket is None:
+            raise ConnectionError("WebSocket is not connected")
+
+        while len(self._recv_buffer) < size:
+            try:
+                chunk = self.socket.recv(max(4096, size - len(self._recv_buffer)))
+            except socket.timeout:
+                raise
+
+            if not chunk:
+                raise ConnectionError("WebSocket EOF")
+
+            self._recv_buffer.extend(chunk)
+
+        result = bytes(self._recv_buffer[:size])
+        del self._recv_buffer[:size]
+
+        return result
+
+    #----------------------------------------------------------------------
+    def _send_close(self, payload: bytes = b"") -> None:
+        try:
+            self._send_frame(0x8, payload)
+        except Exception:
+            pass
+
+    #----------------------------------------------------------------------
+    def _send_frame(self, opcode: int, payload: bytes = b"") -> None:
+        if self.socket is None:
+            raise ConnectionError("WebSocket is not connected")
+
+        # All client-to-server frames MUST be masked.
+        mask = os.urandom(4)
+        length = len(payload)
+        if length < 126:
+            header = struct.pack("!BB",  0x80|opcode, 0x80|length)
+        elif length <= 0xFFFF:
+            header = struct.pack("!BBH", 0x80|opcode, 0x80|126, length)
+        else:
+            header = struct.pack("!BBQ", 0x80|opcode, 0x80|127, length)
+
+        masked_payload = bytes(
+            value ^ mask[index % 4]
+            for index, value in enumerate(payload)
+        )
+
+        self.socket.sendall(header + mask + masked_payload)
+
+
+# =========================================================================
+class TwitchEventPubClient:
+    """
+    Twitch's EventSub WebSocket is a text-data/server-to-client connection.
+    The client only needs to:
+      - receive text/binary/continuation frames
+      - respond to Ping with Pong
+      - send the WebSocket Close frame
     """
     # BRB Timer for Chat by beporter@users.sourceforge.net
     # https://dev.twitch.tv/console/apps/ja5swzyzsr1euwm0e53h1sxqhk553l
     APP_CLIENT_ID = "ja5swzyzsr1euwm0e53h1sxqhk553l"
-    OAUTH_SCOPES = [ # https://dev.twitch.tv/docs/api/reference/#send-chat-message
-        "chat:read",
-        "chat:edit",
+
+    KICKOFF_URL: str = 'https://beporter.github.io/brb-timer/start.html'
+    ID_URL: str = 'https://id.twitch.tv'
+    API_URL: str = 'https://api.twitch.tv'
+    EVENTSUB_URL: str = 'wss://eventsub.wss.twitch.tv/ws'
+
+    # https://dev.twitch.tv/docs/api/reference/#send-chat-message
+    OAUTH_SCOPES: list[str] = [
+        'user:read:chat',
+        'user:write:chat',
+        'user:bot',
+        'channel:bot',
     ]
-    KICKOFF_URL = "https://beporter.github.io/brb-timer/start.html"
+
+    RECONNECT_DELAY: int = 5
+    CONNECT_TIMEOUT: int = 10
+    HTTP_TIMEOUT: int = 10
 
     #----------------------------------------------------------------------
-    def __init__(self, token: str):
-        self.token = token
+    def __init__(
+        self,
+        oauth: str,
+        callback: ChatMsgCallback,
+    ):
+        self.oauth: str = oauth.removeprefix("oauth:")
+        self.callback: Callable = callback
+
+        self.socket: socket.socket = None
+        self.send_lock: threading.Lock = threading.Lock()
+        self.running: bool = False
+        self.thread: threading.Thread = None
+        self.stop_event: threading.Event = threading.Event()
+
+        self.client_id: str = ''
+        self.user: str = ''
+        self.bot_user_id: int = None # ID of bot connecting to channel.
+        self.channel_user_id = None # ID of channel's owner.
+
+        self.keepalive_timeout: int = 10
 
     #----------------------------------------------------------------------
-    def validate(self) -> Dict[str, any] | False:
+    def start(self) -> None:
+        if self.running:
+            return
+
+        self.running = True
+        self.stop_event.clear()
+
+        self.thread = threading.Thread(
+            target=self._receive_loop,
+            daemon=True,
+            name=f"{SCRIPT_NAME}-TwitchEventSub",
+        )
+        self.thread.start()
+
+    #----------------------------------------------------------------------
+    def close(self) -> None:
+        """
+        Permanently close the client.
+
+        The receiver thread owns the WebSocket and is responsible for
+        closing it.
+        """
+        self.stop()
+
+        thread = self.thread
+        if thread is not None and thread is not threading.current_thread():
+            try:
+                thread.join(timeout=2)
+            except Exception as e:
+                debug(
+                    f"Failed joining Twitch EventSub thread: {e!r}"
+                )
+
+        self.thread = None
+        debug("Twitch EventSub client shut down.")
+
+    #----------------------------------------------------------------------
+    def stop(self) -> None:
+        self.running = False
+        self.stop_event.set()
+
+        # Closing the socket wakes the receive thread if it is blocked in
+        # recv(). The receiver thread remains responsible for final cleanup.
+        if self.socket is not None:
+            try:
+                self.socket.close()
+            except Exception:
+                pass
+
+    #----------------------------------------------------------------------
+    def send_chat(self, message: str) -> None:
+        """
+        Send a chat message through Twitch Helix.
+
+        This is the EventSub/API equivalent of IRC PRIVMSG.
+        """
+        with self.send_lock:
+            if not self.client_id or not self.bot_user_id:
+                raise ConnectionError(
+                    "Twitch client is not connected"
+                )
+
+            if not self.channel_user_id:
+                raise ConnectionError(
+                    "Twitch channel identity is unavailable"
+                )
+
+            body = {
+                "broadcaster_id": self.channel_user_id,
+                "sender_id": self.bot_user_id,
+                "message": message,
+            }
+
+            status, response = self._api_request(
+                "helix/chat/messages",
+                body=body,
+            )
+
+            if not 200 <= status < 300:
+                raise ConnectionError(
+                    "Twitch Send Chat Message failed: "
+                    f"HTTP {status}: {response!r}"
+                )
+
+            try:
+                result = json.loads(response)
+            except json.JSONDecodeError:
+                raise ConnectionError(
+                    f"Invalid Twitch response: {response!r}"
+                )
+
+            data = result.get("data") or []
+            if not data:
+                raise ConnectionError(
+                    f"Twitch returned no chat result: {result!r}"
+                )
+
+            result = data[0]
+            if not result.get("is_sent"):
+                raise ConnectionError(
+                    "Twitch rejected chat message: "
+                    f"{result.get('drop_reason')!r}"
+                )
+
+    #----------------------------------------------------------------------
+    def _receive_loop(self) -> None:
+        while self.running:
+            try:
+                self._connect()
+                self._read_loop()
+
+            except Exception as e:
+                if self.running:
+                    debug(f"Twitch EventSub Listener: {e!r}")
+
+            finally:
+                self._close_socket()
+
+            if self.running:
+                self._wait_for_reconnect()
+
+    #----------------------------------------------------------------------
+    def _connect(self) -> None:
+        """
+        Create a fresh EventSub WebSocket session.
+        """
+        self._initialize_identity()
+
+        ws = _WebSocket(self.EVENTSUB_URL, timeout=self.CONNECT_TIMEOUT)
+        ws.connect()
+        self.socket = ws
+
+        raw = ws.recv_message()
+        if raw is None:
+            raise ConnectionError(
+                "EventSub closed during welcome"
+            )
+
+        if not isinstance(raw, str):
+            raise ConnectionError(
+                "EventSub welcome was not a text frame"
+            )
+
+        try:
+            welcome = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ConnectionError(
+                f"Invalid EventSub welcome: {e}"
+            )
+
+        metadata = welcome.get("metadata") or {}
+        if metadata.get("message_type") != "session_welcome":
+            raise ConnectionError(
+                "Expected EventSub session_welcome, got "
+                f"{metadata.get('message_type')!r}"
+            )
+
+        session = (welcome.get("payload", {}).get("session", {}))
+        session_id = session.get("id")
+        if not session_id:
+            raise ConnectionError(
+                "EventSub welcome did not contain a session ID"
+            )
+
+        self.keepalive_timeout = int(
+            session.get("keepalive_timeout_seconds", 10)
+        )
+
+        self._create_chat_subscription(session_id)
+
+        debug(
+            "Twitch EventSub connected "
+            f"(session={session_id!r})."
+        )
+
+    #----------------------------------------------------------------------
+    def _initialize_identity(self) -> None:
         """
         Check the passed oauth token to determine if it's still valid,
         and who it belongs to.
 
         Ref: https://dev.twitch.tv/docs/authentication/validate-tokens#how-to-validate-a-token
         """
-        resp = self._get('oauth2/validate')
-
+        resp = self._api_request('oauth2/validate')
         if not resp:
             debug("oauth2/validate failed.")
             return False
@@ -204,52 +772,264 @@ class TwitchApi:
             )
             return False
 
-        return {
-            'login': resp.get('login', ''),
-            'broadcaster_id': int(resp.get('user_id', '')),
-            'expires_in': resp.get('expires_in', None), # int seconds
+        self.user = resp.get('login', '')
+        self.client_id = resp.get('client_id', None)
+        self.bot_user_id = resp.get('user_id', '')
+        self.channel_user_id = self.bot_user_id # Bot is always the streamer's id in their own channel.
+        self.expires_in = resp.get('expires_in', None), # int seconds
+
+        if not self.client_id or not self.bot_user_id:
+            raise ConnectionError(
+                "Twitch OAuth validation did not return "
+                "client_id/user_id"
+            )
+
+    #----------------------------------------------------------------------
+    def _create_chat_subscription(
+        self,
+        session_id: str,
+    ) -> None:
+        """
+        Subscribe the EventSub WebSocket session to chat messages.
+
+        Twitch requires the bot's user ID in the user_id condition.
+        """
+        body = {
+            "type": "channel.chat.message",
+            "version": "1",
+            "condition": {
+                "broadcaster_user_id": self.channel_user_id,
+                "user_id": self.channel_user_id,
+            },
+            "transport": {
+                "method": "websocket",
+                "session_id": session_id,
+            },
         }
 
-    #----------------------------------------------------------------------
-    def channel(self, broadcaster_id: int) -> Dict[str, any]:
-        """
-        Get the provided broadcaster's channel details.
-
-        Ref: https://dev.twitch.tv/docs/api/reference#get-channel-information
-        """
-        resp = self._get('helix/channels', {'broadcaster_id': broadcaster_id})
-
+        resp = self._api_request('eventsub/subscriptions', body=body)
         if not resp:
-            debug(
-                "helix/channels failed for "
-                f"broadcaster_id: {broadcaster_id}"
+            raise ConnectionError(
+                "Failed to create Twitch EventSub subscription."
             )
-            return False
-
-        if not resp.get('data') or not resp.get('data', [False])[0]:
-            debug(
-                "No channel data returned for "
-                f"broadcaster_id: {broadcaster_id}"
-            )
-            return False
-
-        channel = resp.get('data')[0]
-        return channel.get('broadcaster_name', '')
 
     #----------------------------------------------------------------------
-    def _get(
+    def _read_loop(self) -> None:
+        if self.socket is None:
+            raise ConnectionError(
+                "EventSub WebSocket is not connected"
+            )
+
+        last_event = time.monotonic()
+        while self.running:
+            try:
+                raw = self.socket.recv_message()
+
+            except socket.timeout:
+                # WebSocket ping/pong is handled internally by
+                # _WebSocket.recv_message(). This timeout is only here so
+                # that stop() can be observed.
+                if not self.running:
+                    return
+
+                if (time.monotonic() - last_event > self.keepalive_timeout):
+                    raise ConnectionError("EventSub keepalive timeout")
+
+                continue
+
+            if raw is None:
+                raise ConnectionError(
+                    "EventSub WebSocket EOF"
+                )
+
+            if not isinstance(raw, str):
+                continue
+
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError as e:
+                debug(
+                    f"Ignoring invalid EventSub JSON: {e!r}"
+                )
+                continue
+
+            message_type = (message.get("metadata", {}).get("message_type"))
+
+            # Both notification and keepalive reset the EventSub
+            # keepalive timer.
+            if message_type in (
+                "notification",
+                "session_keepalive",
+            ):
+                last_event = time.monotonic()
+
+            if message_type == "notification":
+                self._handle_notification(message)
+
+            elif message_type == "session_keepalive":
+                continue
+
+            elif message_type == "session_reconnect":
+                self._handle_reconnect(message)
+                return
+
+            elif message_type == "revocation":
+                self._handle_revocation(message)
+                return
+
+    #----------------------------------------------------------------------
+    def _handle_notification(self, message: dict) -> None:
+        payload = message.get('payload', {})
+        subscription = payload.get('subscription', {})
+        if subscription.get('type') != 'channel.chat.message':
+            return
+
+        chat_message = self._parse_eventsub_message(payload.get('event', {}))
+        if chat_message is not None:
+            self.callback(chat_message)
+
+    #----------------------------------------------------------------------
+    def _parse_eventsub_message(self, event: dict) -> ChatMessage | None:
+        username = event.get('chatter_user_login', '')
+        text = event.get('message', {}).get('text')
+        badges = event.get('badges', [])
+        if not username or text is None:
+            return None
+
+        return ChatMessage(
+            username,
+            event.get('chatter_user_name', username),
+            text,
+            any(
+                badge.get('set_id') == 'moderator'
+                and badge.get('id') == '1'
+                for badge in badges
+            ),
+            any(
+                badge.get('set_id') == 'broadcaster'
+                and badge.get('id') == '1'
+                for badge in badges
+            ),
+        )
+
+    #----------------------------------------------------------------------
+    def _handle_reconnect(self, message: dict) -> None:
+        """
+        Twitch specifically requires us to keep the old connection alive
+        until the new connection has delivered its welcome message.
+        """
+        session = message.get('payload', {}).get('session', {})
+        reconnect_url = session.get('reconnect_url')
+        if not reconnect_url:
+            raise ConnectionError(
+                "EventSub reconnect message has no reconnect URL"
+            )
+
+        debug("Twitch requested EventSub reconnect.")
+
+        old_ws = self.socket
+        new_ws = _WebSocket(reconnect_url, timeout=self.CONNECT_TIMEOUT)
+        try:
+            new_ws.connect()
+            raw = new_ws.recv_message()
+            if not isinstance(raw, str):
+                raise ConnectionError(
+                    "EventSub reconnect did not return "
+                    "a text welcome message"
+                )
+
+            welcome = json.loads(raw)
+            message_type = welcome.get('metadata', {}).get('message_type')
+            if (message_type != 'session_welcome'):
+                raise ConnectionError(
+                    "Invalid EventSub reconnect welcome"
+                )
+
+            new_session = welcome.get('payload', {}).get('session', {})
+            self.keepalive_timeout = int(
+                new_session.get(
+                    "keepalive_timeout_seconds",
+                    self.keepalive_timeout,
+                )
+            )
+
+            # Only switch after the new socket has successfully completed
+            # the WebSocket handshake AND received its EventSub welcome.
+            self.socket = new_ws
+
+            # Now that the new connection has inherited the subscriptions,
+            # the old socket can be closed.
+            if old_ws is not None:
+                old_ws.close()
+
+            debug("Twitch EventSub reconnect completed.")
+
+        except Exception:
+            new_ws.close()
+            raise
+
+    #----------------------------------------------------------------------
+    def _handle_revocation(self, message: dict) -> None:
+        subscription = (message.get("payload", {}).get("subscription", {}))
+
+        debug(
+            "Twitch EventSub subscription revoked: "
+            f"type={subscription.get('type')!r}, "
+            f"status={subscription.get('status')!r}"
+        )
+
+        # Don't reconnect after a revoked authorization.
+        self.running = False
+        self.stop_event.set()
+
+    #----------------------------------------------------------------------
+    def _wait_for_reconnect(self) -> None:
+        self.stop_event.wait(self.RECONNECT_DELAY)
+
+    #----------------------------------------------------------------------
+    def _close_socket(self) -> None:
+        """
+        Close the network connection. Called by the receiver thread.
+        """
+        ws = self.socket
+        self.socket = None
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    #----------------------------------------------------------------------
+    def _api_request(
         self,
         path: str,
-        params: Dict[str, str|int] = {},
+        body: dict|None = None,
+        params: dict|None = None,
         extra_headers: Dict[str, str|int] = {},
-    ) -> object | False:
-        server = self._server(path)
-        url = f"{server}/{path}?" + parse.urlencode(params)
-        req = request.Request(url, headers=self._headers(extra_headers))
+    ) -> object|False:
+        if not self.client_id:
+            raise ConnectionError(
+                "Twitch client ID is unavailable"
+            )
+
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            extra_headers["Content-Type"] = "application/json"
+        req = request.Request(
+            f"{self._server(path)}/{path}?" + parse.urlencode(params),
+            method='POST' if body is not None else 'GET',
+            headers=self._headers(extra_headers),
+            data=data,
+        )
 
         try:
-            with request.urlopen(req) as r:
-                return json.load(r)
+            with request.urlopen(
+                req,
+                timeout=TwitchEventPubClient.HTTP_TIMEOUT,
+            ) as r:
+                return json.load(e.fp)
+
         except error.HTTPError as e:
             match e.code:
                 case http.HTTPStatus.UNAUTHORIZED:
@@ -282,9 +1062,9 @@ class TwitchApi:
     def _server(self, path: str) -> str:
         match path.split('/', 2)[0]:
             case 'oauth2':
-                return 'https://id.twitch.tv'
+                return self.ID_URL
             case _:
-                return 'https://api.twitch.tv'
+                return self.API_URL
 
     #----------------------------------------------------------------------
     def _headers(
@@ -294,320 +1074,9 @@ class TwitchApi:
         return {
             'User-Agent': f"{SCRIPT_NAME} v{SCRIPT_VERSION}",
             'Accept': 'application/json',
-            'Authorization': f"Bearer {self.token}",
-            'Client-ID': self.APP_CLIENT_ID,
+            'Authorization': f"Bearer {self.oauth}",
+            'Client-ID': self.client_id,
         } | extra
-
-# =========================================================================
-@dataclass
-class ChatMessage(object):
-    """
-    Message passing container from the IRC client to the command parser.
-    """
-    username: str
-    display_name: str
-    message: str
-    is_mod: bool
-    is_broadcaster: bool
-
-# =========================================================================
-type IrcMsgCallback = Callable[[ChatMessage], None]
-
-class TwitchIRCClient:
-    HOST = "irc.chat.twitch.tv"
-    PORT = 6697
-    RECONNECT_DELAY = 5
-
-    #----------------------------------------------------------------------
-    def __init__(
-        self,
-        channel: str,
-        username: str,
-        oauth: str,
-        callback: IrcMsgCallback,
-    ):
-        self.channel = channel.lower().lstrip("#")
-        self.username = username
-        self.oauth = oauth.removeprefix("oauth:")
-        self.callback = callback
-
-        self.socket = None
-        self.send_lock = threading.Lock()
-        self.running = False
-        self.thread = None
-
-    #----------------------------------------------------------------------
-    def start(self) -> None:
-        if self.running:
-            return
-
-        self._create_wakeup_pair()
-        self._drain_wakeup()
-
-        self.running = True
-        self.thread = threading.Thread(
-            target=self._receive_loop,
-            daemon=True,
-            name=f"{SCRIPT_NAME}-TwitchIRC",
-        )
-        self.thread.start()
-
-    #----------------------------------------------------------------------
-    def close(self) -> None:
-        """
-        Permanently close the client.
-
-        The receiver thread owns the network socket and is responsible for
-        closing it. The wakeup pair is only used to signal that thread.
-        """
-        self.stop()
-
-        thread = self.thread
-        if thread is not None and thread is not threading.current_thread():
-            try:
-                thread.join(timeout=2)
-            except Exception as e:
-                debug(f"Failed joining Twitch IRC thread: {e!r}")
-
-        self.thread = None
-        self._destroy_wakeup_pair()
-        debug("IRC client shut down.")
-
-    #----------------------------------------------------------------------
-    def stop(self) -> None:
-        self.running = False
-        self._wake()
-
-    #----------------------------------------------------------------------
-    def send_chat(self, message: str) -> None:
-        self._send_raw(f"PRIVMSG #{self.channel} :{message}")
-
-    #----------------------------------------------------------------------
-    def _create_wakeup_pair(self) -> None:
-        self.wakeup_reader, self.wakeup_writer = socket.socketpair()
-
-    #----------------------------------------------------------------------
-    def _wake(self) -> None:
-        try:
-            if self.wakeup_writer is not None:
-                self.wakeup_writer.send(b"\x00")
-        except OSError as e:
-            debug(f"Failed to wake IRC thread: {e!r}")
-
-    #----------------------------------------------------------------------
-    def _drain_wakeup(self) -> None:
-        if self.wakeup_reader is None:
-            return
-
-        self.wakeup_reader.setblocking(False)
-        try:
-            while self.wakeup_reader.recv(4096):
-                pass
-        except BlockingIOError:
-            pass
-        except OSError:
-            pass
-        finally:
-            try:
-                self.wakeup_reader.setblocking(True)
-            except OSError:
-                pass
-
-    #----------------------------------------------------------------------
-    def _destroy_wakeup_pair(self) -> None:
-        for sock in (self.wakeup_reader, self.wakeup_writer):
-            try:
-                if sock is not None:
-                    sock.close()
-            except OSError:
-                debug(f"Failed to close IRC sockets: {e!r}")
-
-        self.wakeup_reader = None
-        self.wakeup_writer = None
-
-    #----------------------------------------------------------------------
-    def _send_raw(self, line: str) -> None:
-        with self.send_lock:
-            if self.socket is None:
-                raise ConnectionError("IRC socket is not connected")
-
-            self.socket.sendall((line + "\r\n").encode("utf-8"))
-
-    #----------------------------------------------------------------------
-    def _connect(self) -> None:
-        """
-        Establish an SSL-wrapped socket connection.
-
-        Ref: https://stackoverflow.com/a/23615951/70876
-        """
-        sock = ssl.create_default_context().wrap_socket(
-            socket.create_connection(
-                (self.HOST, self.PORT),
-                timeout=10,
-            ),
-            server_hostname=self.HOST,
-        )
-        sock.setblocking(True)
-        self.socket = sock
-
-        # Ref: https://dev.twitch.tv/docs/chat/irc
-        self._send_raw("CAP REQ :twitch.tv/tags twitch.tv/commands")
-        self._send_raw(f"PASS oauth:{self.oauth}")
-        self._send_raw(f"NICK {self.username}")
-        self._send_raw(f"JOIN #{self.channel}")
-
-        debug("IRC client connected.")
-
-    #----------------------------------------------------------------------
-    def _receive_loop(self) -> None:
-        while self.running:
-            try:
-                self._connect()
-                self._read_loop()
-
-            except Exception as e:
-                if self.running:
-                    debug(f"Twitch IRC Listener: {e!r}")
-
-            finally:
-                self._close_socket()
-
-            if self.running:
-                self._wait_for_reconnect()
-
-    #----------------------------------------------------------------------
-    def _read_loop(self) -> None:
-        buffer = b""
-
-        while self.running:
-            readable, _, _ = select.select(
-                [self.socket, self.wakeup_reader],
-                [],
-                [],
-            )
-            if self.wakeup_reader in readable:
-                self._drain_wakeup()
-                return
-
-            if self.socket not in readable:
-                continue
-
-            data = self.socket.recv(4096)
-            if not data:
-                raise ConnectionError("EOF")
-
-            buffer += data
-            while b"\r\n" in buffer:
-                raw_line, buffer = buffer.split(b"\r\n", 1)
-                line = raw_line.decode("utf-8", errors="replace")
-                self._handle_line(line)
-
-                if not self.running:
-                    return
-
-    #----------------------------------------------------------------------
-    def _wait_for_reconnect(self) -> None:
-        if self.wakeup_reader is None:
-            return
-
-        try:
-            readable, _, _ = select.select(
-                [self.wakeup_reader],
-                [],
-                [],
-                self.RECONNECT_DELAY,
-            )
-
-            if readable:
-                self._drain_wakeup()
-
-        except OSError as e:
-            debug(f"Failed waiting for IRC reconnect: {e!r}")
-
-    #----------------------------------------------------------------------
-    def _close_socket(self) -> None:
-        """
-        Close the network socket.
-
-        This is exclusively called by the receiver thread, which owns
-        the socket.
-        """
-        sock = self.socket
-        self.socket = None
-
-        if sock is not None:
-            try:
-                sock.close()
-            except OSError:
-                pass
-
-    #----------------------------------------------------------------------
-    def _handle_line(self, line: str) -> None:
-        if line.startswith("PING"):
-            self._send_raw(line.replace("PING", "PONG", 1))
-            return
-
-        if line.startswith(":tmi.twitch.tv RECONNECT"):
-            raise ConnectionError("Twitch requested reconnect")
-
-        if (
-            " NOTICE * :Login authentication failed" in line
-            or " NOTICE * :Improperly formatted auth" in line
-        ):
-            debug("Twitch IRC authentication failed")
-            self.running = False
-            return
-
-        if " PRIVMSG " not in line:
-            return
-
-        msg = self._parse_privmsg(line)
-        if msg:
-            self.callback(msg)
-
-    #----------------------------------------------------------------------
-    def _parse_privmsg(self, line: str) -> ChatMessage | None:
-        if not line:
-            return None
-
-        try:
-            tags_raw, remainder = line.split(" ", 1)
-            prefix, command, channel, message = remainder.split(" ", 3)
-        except ValueError:
-            return None
-
-        if (
-            not tags_raw.startswith("@")
-            or command != "PRIVMSG"
-            or not prefix.startswith(":")
-            or not message.startswith(":")
-        ):
-            return None
-
-        tags = self._parse_tags(tags_raw[1:])
-        badges = set(tags.get("badges", "").split(","))
-        username = prefix[1:].split("!", 1)[0]
-        if not username:
-            return None
-
-        return ChatMessage(
-            username,
-            tags.get("display-name", username),
-            message[1:],
-            tags.get("mod") == "1",
-            "broadcaster/1" in badges,
-        )
-
-    #----------------------------------------------------------------------
-    @staticmethod
-    def _parse_tags(raw: str) -> Dict[str, str]:
-        result = {}
-        for field in raw.split(";"):
-            if "=" in field:
-                key, value = field.split("=", 1)
-                result[key] = value
-
-        return result
 
 
 ###########################################################################
@@ -720,9 +1189,7 @@ class Events:
             self.stop_time = 0
             self.hide_time = 0
 
-            OBS2.source_set_text_by_name(self.source_name, self.ticker_text())
-            #OBS2.timer_add(self.ticker, 1 * 1000) # TODO: This is causing a crash. But only when called from irc, not from on_start_button
-            #S.timer_add(ticker, 1 * 1000)
+            # (Timer is already running, so just show it.)
             OBS2.sceneitem_set_visible_by_name(self.source_name, True)
 
     #----------------------------------------------------------------------
@@ -801,13 +1268,13 @@ class Events:
         Convenience/consistency wrapper for sending messages out through
         IRC. Ensures the client is started.
         """
-        global irc_client
+        global chat_client
 
-        if irc_client is None or not irc_client.running:
-            debug(f"Tried to send irc chat, but client is not connected. ({msg})")
+        if chat_client is None or not chat_client.running:
+            debug(f"Tried to send chat, but client is not connected. ({msg})")
             return
 
-        irc_client.send_chat(msg)
+        chat_client.send_chat(msg)
 
     #----------------------------------------------------------------------
     def command_brb(self, msg: ChatMessage) -> None:
@@ -872,7 +1339,7 @@ class Events:
     #----------------------------------------------------------------------
     def command_back(self, msg: ChatMessage) -> None:
         """
-        Handler that's called when self.irc returns a ChatMessage with
+        Handler that's called when chat_client returns a ChatMessage with
         a !back command.
         """
         debug("Handling !back.")
@@ -914,7 +1381,7 @@ class Events:
 
 
 ###########################################################################
-# Timers
+# OBS Wrapper
 
 # =========================================================================
 type OBSTimer = Callable[[], None]
@@ -990,7 +1457,7 @@ def dispatch(callback: callable) -> callable:
 # Global State
 
 e: Events = Events()
-irc_client: TwitchIRCClient = None
+chat_client: TwitchEventPubClient = None
 
 
 ###########################################################################
@@ -1083,7 +1550,7 @@ def script_properties():
         lambda: None,
     )
     S.obs_property_button_set_type(b, S.OBS_BUTTON_URL)
-    S.obs_property_button_set_url(b, TwitchApi.KICKOFF_URL)
+    S.obs_property_button_set_url(b, TwitchEventPubClient.KICKOFF_URL)
     S.obs_property_set_long_description(
         b,
         (
@@ -1140,7 +1607,7 @@ def script_update(settings):
     and a few other places. The thing getting updated here is this very
     script, not the settings and not OBS.
     """
-    global irc_client
+    global chat_client
     debug(f"script_update starting.")
 
     new_token = S.obs_data_get_string(settings, 'twitch_token')
@@ -1150,43 +1617,29 @@ def script_update(settings):
         and new_token != e.token
     ):
         e.token = new_token
-        api = TwitchApi(e.token)
-        valid = api.validate()
-        if valid:
-            e.user = valid['login']
-            e.channel = api.channel(valid['broadcaster_id'])
-
-            S.obs_data_set_string(settings, 'twitch_user', e.user)
-            S.obs_data_set_string(settings, 'twitch_channel', e.channel)
-
-        if irc_client is not None:
-            irc_client.close()
-            irc_client = None
+        if chat_client is not None:
+            chat_client.close()
+            chat_client = None
 
     if (
         len(e.token) > 0
         and len(e.user) > 0
         and len(e.channel) > 0
-        and irc_client is None
+        and chat_client is None
     ):
-        irc_client = TwitchIRCClient(
-            e.channel,
-            e.user,
-            e.token,
-            e.on_chat,
-        )
-        irc_client.start()
+        chat_client = TwitchEventPubClient(e.token, e.on_chat)
+        chat_client.start()
 
     debug('script_update complete.')
 
 #--------------------------------------------------------------------------
 def script_unload():
+    global chat_client
+
     S.timer_remove(e.ticker)
 
-    global irc_client
-
-    if irc_client is not None:
-        irc_client.close()
-        irc_client = None
+    if chat_client is not None:
+        chat_client.close()
+        chat_client = None
 
     debug('script_unload complete.')
