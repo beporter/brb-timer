@@ -1,8 +1,10 @@
 """
-'Minimal' implementation of BRB Timer, starting from working timer example in simple.py.
+BRB Timer for OBS Studio
+https://github.com/beporter/brb-timer
 """
 from __future__ import annotations
 import base64
+import contextlib
 from dataclasses import dataclass
 import datetime
 import hashlib
@@ -31,6 +33,7 @@ class DEFAULTS:
     TEXT_TIMER = f"{SCRIPT_NAME} - Timer"
     TRANSITION_SHOW = f"{SCRIPT_NAME} - Show Transition"
     TRANSITION_HIDE = f"{SCRIPT_NAME} - Hide Transition"
+
 
 ###########################################################################
 # Chat Commands and Messages
@@ -133,7 +136,8 @@ class DT:
     @classmethod
     def strpdelta(self, time_str: str) -> int | False:
         """
-        Parse the provided `[[HH:]MM:]SS` string into a integer number of seconds.
+        Parse the provided `[[HH:]MM:]SS` string into a integer number
+        of seconds.
 
         Ref: timedelta https://stackoverflow.com/a/51916936/70876
         Ref: regex https://stackoverflow.com/a/8318367/70876
@@ -273,9 +277,7 @@ class _WebSocket:
             )
 
         expected_accept = base64.b64encode(
-            hashlib.sha1(
-                (key + self.MAGIC).encode("ascii")
-            ).digest()
+            hashlib.sha1((key + self.MAGIC).encode("ascii")).digest()
         ).decode("ascii")
 
         if accept.strip() != expected_accept:
@@ -649,11 +651,11 @@ class TwitchEventPubClient:
         if self.thread is not None and self.thread is not threading.current_thread():
             self.thread.join(timeout=2)
             if self.thread.is_alive():
-                debug(f"Failed joining Twitch EventSub thread.")
+                OBS.debug(f"Failed joining Twitch EventSub thread.")
                 raise
 
         self.thread = None
-        debug("Twitch EventSub client shut down.")
+        OBS.debug("Twitch EventSub client shut down.")
 
     #----------------------------------------------------------------------
     def stop(self) -> None:
@@ -713,7 +715,7 @@ class TwitchEventPubClient:
                 self._read_loop()
 
             except ConnectionError as e:
-                debug(f"Connection error: {e!r}")
+                OBS.debug(f"Connection error: {e!r}")
                 pass
 
             finally:
@@ -731,11 +733,10 @@ class TwitchEventPubClient:
             self.running = False
             return
 
-        ws = _WebSocket(self.EVENTSUB_URL, timeout=self.CONNECT_TIMEOUT)
-        ws.connect()
-        self.socket = ws
+        self.socket = _WebSocket(self.EVENTSUB_URL, timeout=self.CONNECT_TIMEOUT)
+        self.socket.connect()
 
-        raw = ws.recv_message()
+        raw = self.socket.recv_message()
         if raw is None:
             raise ConnectionError("EventSub closed during welcome")
 
@@ -767,7 +768,7 @@ class TwitchEventPubClient:
 
         self._create_chat_subscription(session_id)
 
-        debug(
+        OBS.debug(
             "Twitch EventSub connected "
             f"(session={session_id!r})."
         )
@@ -782,16 +783,16 @@ class TwitchEventPubClient:
         """
         resp = self._api_request('oauth2/validate')
         if not resp:
-            debug("oauth2/validate failed.")
+            OBS.debug("oauth2/validate failed.")
             return False
 
         if not resp['login']:
-            debug("OAuth token is not attached to a user.")
+            OBS.debug("OAuth token is not attached to a user.")
             return False
 
         if not set(self.OAUTH_SCOPES).issubset(resp['scopes']):
             missing_scopes = ", ".join(set(self.OAUTH_SCOPES) - set(resp['scopes']))
-            debug(
+            OBS.debug(
                 "OAuth token is lacking necessary scopes: "
                 f"{missing_scopes!s}"
             )
@@ -808,7 +809,7 @@ class TwitchEventPubClient:
             or not self.bot_user_id
             or not self.channel_user_id
         ):
-            debug("Twitch OAuth validation did not return client_id/user_id")
+            OBS.debug("Twitch OAuth validation did not return client_id/user_id")
             return False
 
         return True
@@ -860,7 +861,7 @@ class TwitchEventPubClient:
                 continue
 
             if not self.running:
-                return
+                return # Ends thread excution.
 
             if not isinstance(raw, str):
                 continue
@@ -868,7 +869,7 @@ class TwitchEventPubClient:
             try:
                 message = json.loads(raw)
             except json.JSONDecodeError as e:
-                debug(f"Ignoring invalid EventSub JSON: {e!r}")
+                OBS.debug(f"Ignoring invalid EventSub JSON: {e!r}")
                 continue
 
             message_type = message.get("metadata", {}).get("message_type")
@@ -931,7 +932,7 @@ class TwitchEventPubClient:
                 "EventSub reconnect message has no reconnect URL"
             )
 
-        debug("Twitch requested EventSub reconnect.")
+        OBS.debug("Twitch requested EventSub reconnect.")
 
         old_ws = self.socket
         new_ws = _WebSocket(reconnect_url, timeout=self.CONNECT_TIMEOUT)
@@ -968,7 +969,7 @@ class TwitchEventPubClient:
             if old_ws is not None:
                 old_ws.close()
 
-            debug("Twitch EventSub reconnect completed.")
+            OBS.debug("Twitch EventSub reconnect completed.")
 
         except (
             OSError,
@@ -976,14 +977,14 @@ class TwitchEventPubClient:
             ConnectionError,
             TimeoutError,
         ) as e:
-            debug(f"reconnect failure: {e!r}")
+            OBS.debug(f"reconnect failure: {e!r}")
             new_ws.close()
 
     #----------------------------------------------------------------------
     def _handle_revocation(self, message: dict) -> None:
         subscription = (message.get("payload", {}).get("subscription", {}))
 
-        debug(
+        OBS.debug(
             "Twitch EventSub subscription revoked: "
             f"type={subscription.get('type')!r}, "
             f"status={subscription.get('status')!r}"
@@ -1061,7 +1062,7 @@ class TwitchEventPubClient:
                 case _:
                     detail = e.reason
 
-        debug(f"_api_request failure: {detail}")
+        OBS.debug(f"_api_request failure: {detail}")
         return False
 
     #----------------------------------------------------------------------
@@ -1110,12 +1111,13 @@ class Events:
         if event != S.OBS_FRONTEND_EVENT_FINISHED_LOADING:
             return
 
-        if not OBS2.source_exists(self.source_name):
-            debug(f"TODO: create source {self.source_name} here")
+        if not OBS.source_exists(self.source_name):
+            OBS.debug(f"TODO: create source {self.source_name} here")
+            #self.create_source(self.source_name, '--:--')
 
         # Make sure the timer is hidden on startup.
-        OBS2.sceneitem_set_visible_by_name(self.source_name, False)
-        debug(f"on_event complete")
+        OBS.sceneitem_set_visible_by_name(self.source_name, False)
+        OBS.debug(f"on_event complete")
 
     #----------------------------------------------------------------------
     def on_chat(self, message: ChatMessage) -> None:
@@ -1125,27 +1127,15 @@ class Events:
         This router is only responsible for determining whether to
         respond to an event and routing it to a handler, or ignore it.
         """
-        match message.message.split()[0]:
+        match message.message.strip().split()[0]:
             case COMMANDS.BRB:
                 self.command_brb(message)
             case COMMANDS.AT:
                 self.command_at(message)
             case COMMANDS.BACK:
                 self.command_back(message)
-            # case 'show': #  TODO: remove
-            #     OBS2.sceneitem_set_visible_by_name(self.source_name, True)
-            # case 'hide':
-            #     OBS2.sceneitem_set_visible_by_name(self.source_name, False)
-            # case 'start': #  TODO: remove
-            #     #q.put('start')
-            #     self.running = True
-            #     OBS2.sceneitem_set_visible_by_name(self.source_name, True)
-            # case 'stop':
-            #     #q.put('stop')
-            #     self.running = False
-            #     OBS2.sceneitem_set_visible_by_name(self.source_name, False)
             case _:
-                debug('No BRB commands matched. Skipping.')
+                OBS.debug('No BRB commands matched. Skipping.')
 
     #----------------------------------------------------------------------
     def ticker(self):
@@ -1155,24 +1145,15 @@ class Events:
         props for this script. Can NOT be scheduled via obs.timer_add()
         from a separate python thread (such as the irc client).
         """
-        # debug(
-        #     f"timer running. "
-        #     f"source = {self.source_name}, "
-        #     f"running = {self.running}, "
-        #     f"hide_time = {self.hide_time}, "
-        #     f"text = {self.ticker_text()} "
-        # )
         if not self.running:
             return
 
         if self.hide_time > 0 and int(time.time()) > self.hide_time:
-            debug('hide_time reached, hiding on-screen text')
-            OBS2.sceneitem_set_visible_by_name(self.source_name, False)
-            #OBS2.timer_remove(self.ticker)
-            #S.remove_current_callback()
+            OBS.debug('hide_time reached, hiding on-screen text')
+            OBS.sceneitem_set_visible_by_name(self.source_name, False)
             return
 
-        OBS2.source_set_text_by_name(self.source_name, self.ticker_text())
+        OBS.source_set_text_by_name(self.source_name, self.ticker_text())
 
     #----------------------------------------------------------------------
     def ticker_text(self) -> str:
@@ -1199,7 +1180,7 @@ class Events:
             self.hide_time = 0
 
             # (Timer is already running, so just show it.)
-            OBS2.sceneitem_set_visible_by_name(self.source_name, True)
+            OBS.sceneitem_set_visible_by_name(self.source_name, True)
 
     #----------------------------------------------------------------------
     def has_guess(self, username: str) -> int | False:
@@ -1280,7 +1261,7 @@ class Events:
         global chat_client
 
         if chat_client is None or not chat_client.running:
-            debug(f"Tried to send chat, but client is not connected. ({msg})")
+            OBS.debug(f"Tried to send chat, but client is not connected. ({msg})")
             return
 
         chat_client.send_chat(msg)
@@ -1290,15 +1271,15 @@ class Events:
         """
         Handle a !brb command.
         """
-        debug("Handling !brb.")
+        OBS.debug("Handling !brb.")
         # Validate command was sent by broadcaster or nod.
         if not (msg.is_mod or msg.is_broadcaster):
-            debug("Only mods can start brb.")
+            OBS.debug("Only mods can start brb.")
             self.send_chat(MESSAGES.ONLY_MOD_START)
             return
 
         if self.running:
-            debug("brb already running.")
+            OBS.debug("brb already running.")
             self.send_chat(MESSAGES.ALREADY_RUNNING)
             return
 
@@ -1307,29 +1288,29 @@ class Events:
         # Send the starting chat message.
         self.send_chat(MESSAGES.BRB_STARTED(streamer=self.user))
 
-        debug("brb handled.")
+        OBS.debug("brb handled.")
 
     #----------------------------------------------------------------------
     def command_at(self, msg: ChatMessage) -> None:
         """
         Handle an !at command.
         """
-        debug("Handling !at.")
+        OBS.debug("Handling !at.")
         if not self.running:
-            debug("No brb running.")
+            OBS.debug("No brb running.")
             self.send_chat(MESSAGES.NO_BRB)
             return
 
         [_cmd, time_str, *_rest] = msg.message.split()
         delta = DT.strpdelta(time_str)
         if not delta:
-            debug(f"Failed to parse !at in message: {msg}")
+            OBS.debug(f"Failed to parse !at in message: {msg}")
             self.send_chat(MESSAGES.BAD_GUESS(user=msg.username))
             return
 
         existing_guess = self.has_guess(msg.username)
         if existing_guess:
-            debug(f"User {msg.username} already has a guess registered: {existing_guess}")
+            OBS.debug(f"User {msg.username} already has a guess registered: {existing_guess}")
             self.send_chat(MESSAGES.ALREADY_GUESSED(
                 user=msg.username,
                 guess=DT.strfdelta(existing_guess),
@@ -1337,13 +1318,13 @@ class Events:
             return
 
         if self.add_guess(msg.username, delta):
-            debug(f"Guess registered for user {msg.username}: {delta}")
+            OBS.debug(f"Guess registered for user {msg.username}: {delta}")
             self.send_chat(MESSAGES.GUESS_ACCEPTED(
                 user=msg.username,
                 guess=DT.strfdelta(delta),
             ))
 
-        debug("!at handled.")
+        OBS.debug("!at handled.")
 
     #----------------------------------------------------------------------
     def command_back(self, msg: ChatMessage) -> None:
@@ -1353,28 +1334,28 @@ class Events:
         """
         global chat_client
 
-        debug("Handling !back.")
+        OBS.debug("Handling !back.")
         # Validate command was sent by broadcaster or nod.
         if not (msg.is_mod or msg.is_broadcaster):
-            debug("Only mods can run !back.")
+            OBS.debug("Only mods can run !back.")
             self.send_chat(MESSAGES.ONLY_MOD_END)
             return
 
         if not self.running:
-            debug("No brb running.")
+            OBS.debug("No brb running.")
             self.send_chat(MESSAGES.NO_BRB)
             return
 
         # Disallow further guessing.
         if self.running:
-            debug("Stopping guesses.")
+            OBS.debug("Stopping guesses.")
             self.guess_end(self.auto_hide_secs)
 
         # Announce the winner.
         (winner, guess_secs) = self.guess_winner()
         actual_secs = self.stop_time - self.start_time
         if winner:
-            debug(f"!brb winner is: {winner}")
+            OBS.debug(f"!brb winner is: {winner}")
             self.send_chat(MESSAGES.BRB_FINISHED(
                 streamer=chat_client.user,
                 time=DT.strfdelta(actual_secs),
@@ -1382,13 +1363,13 @@ class Events:
                 diff=DT.strfdelta(actual_secs - guess_secs),
             ))
         else:
-            debug("No (valid) guesses, so no winner.")
+            OBS.debug("No (valid) guesses, so no winner.")
             self.send_chat(MESSAGES.BRB_FINISHED_NO_GUESSES(
                 streamer=self.user,
                 time=DT.strfdelta(actual_secs),
             ))
 
-        debug("!back handled.")
+        OBS.debug("!back handled.")
 
 
 ###########################################################################
@@ -1397,7 +1378,7 @@ class Events:
 # =========================================================================
 type OBSTimer = Callable[[], None]
 
-class OBS2:
+class OBS:
     #----------------------------------------------------------------------
     @classmethod
     def source_exists(self, source_name: str) -> bool:
@@ -1422,7 +1403,7 @@ class OBS2:
         si = S.obs_scene_find_source(scene, source_name) # Don't release unless an explicit ref was saved.
         if si is not None:
             if S.obs_sceneitem_visible(si) is not visible:
-                debug(f"{'showing' if visible else 'hiding'} sceneitem.")
+                self.debug(f"{'showing' if visible else 'hiding'} sceneitem.")
                 S.obs_sceneitem_set_visible(si, visible)
             #S.obs_sceneitem_release(si) # DON'T release??
             S.obs_source_release(scene_source)
@@ -1439,23 +1420,50 @@ class OBS2:
             S.obs_source_release(source)
             S.obs_data_release(settings)
 
+    #----------------------------------------------------------------------
+    @classmethod
+    def error(self, msg: str) -> None:
+        self._log(msg, S.LOG_ERROR)
 
-###########################################################################
-# Global Methods
+    #----------------------------------------------------------------------
+    @classmethod
+    def warn(self, msg: str) -> None:
+        self._log(msg, S.LOG_WARNING)
 
-#--------------------------------------------------------------------------
-def debug(msg: str):
-    # Grab our frame and at most three parent frames.
-    stack = [
-        f for f in inspect.stack(0)
-        if f.frame.f_code.co_qualname
-        not in ['dispatch.<locals>.handle']
-    ]
-    callers_caller_frameinfo = stack[0:3][-1]
-    calling_method = callers_caller_frameinfo.frame.f_code.co_qualname
-    S.script_log(S.LOG_DEBUG, f"[{calling_method}] {msg}")
+    #----------------------------------------------------------------------
+    @classmethod
+    def info(self, msg: str) -> None:
+        self._log(msg, S.LOG_INFO)
 
-# TODO: Bring back info() and warn().
+    #----------------------------------------------------------------------
+    @classmethod
+    def debug(self, msg: str) -> None:
+        self._log(msg, S.LOG_DEBUG)
+
+    #----------------------------------------------------------------------
+    @classmethod
+    def _log(self, msg: str, level: int) -> None:
+        # Grab our frame and all parents we don't want to exclude.
+        stack = [
+            f for f in inspect.stack(0)
+            if f.frame.f_code.co_qualname not in [
+                'dispatch.<locals>.handle',
+            ]
+        ]
+
+        # The last element in the pre-filtered slice of (up to) 3 is the
+        # farthest-most caller. This handles the case where there's less
+        # than 2 stacks above us.
+        callers_caller_frameinfo = stack[0:3][-1]
+
+        # Dig into the frame details to get the fully qualified method name.
+        calling_method = callers_caller_frameinfo.frame.f_code.co_qualname
+
+        S.script_log(level, f"[{calling_method}] {msg}")
+
+
+# TODO: Review calls to debug(), switch those appriopriate to info/warn/error().
+
 
 ###########################################################################
 # Global State
@@ -1573,7 +1581,7 @@ def script_properties():
     )
     # S.obs_property_set_modified_callback(t, dispatch(e.on_token_modified))
 
-    debug('script_properties complete.')
+    OBS.debug('script_properties complete.')
     return props
 
 #--------------------------------------------------------------------------
@@ -1583,7 +1591,7 @@ def script_load(settings):
     the __init__ for this script as it exists in OBS. Happens before
     the GUI is ready, so you can't query scenes or sources here.
     """
-    debug(f"script_load setting running = False.")
+    OBS.debug(f"script_load setting running = False.")
     e.running = False
 
     S.obs_frontend_add_event_callback(lambda ev: e.on_event(ev))
@@ -1592,7 +1600,7 @@ def script_load(settings):
     # (It will no-op unless a !brb is running.)
     S.timer_add(e.ticker, 1 * 1000)
 
-    debug(f"script_load complete.")
+    OBS.debug(f"script_load complete.")
 
 #--------------------------------------------------------------------------
 def script_update(settings):
@@ -1605,7 +1613,7 @@ def script_update(settings):
     script, not the settings and not OBS.
     """
     global chat_client
-    debug(f"script_update starting.")
+    OBS.debug(f"script_update starting.")
 
     new_token = S.obs_data_get_string(settings, 'twitch_token')
     if (
@@ -1615,19 +1623,19 @@ def script_update(settings):
     ):
         e.token = new_token
         if chat_client is not None:
-            debug('Closing old chat client.')
+            OBS.debug('Closing old chat client.')
             chat_client.close()
             chat_client = None
 
     if len(e.token) > 0:
-        debug('Starting new chat client.')
+        OBS.debug('Starting new chat client.')
         chat_client = TwitchEventPubClient(e.token, e.on_chat)
         chat_client.start()
         if chat_client.running:
-            debug(f"Setting username: {chat_client.user}")
+            OBS.debug(f"Setting username: {chat_client.user}")
             e.user = chat_client.user
 
-    debug('script_update complete.')
+    OBS.debug('script_update complete.')
 
 #--------------------------------------------------------------------------
 def script_unload():
@@ -1639,4 +1647,4 @@ def script_unload():
         chat_client.close()
         chat_client = None
 
-    debug('script_unload complete.')
+    OBS.debug('script_unload complete.')
