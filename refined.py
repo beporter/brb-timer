@@ -17,6 +17,7 @@ import re
 import socket
 import ssl
 import struct
+import sys
 from textwrap import dedent
 import threading
 import time
@@ -38,8 +39,9 @@ except ImportError:
 
     logging.debug('obs module unavailable. Replaced with a mock.')
 
-logging.getLogger(__name__)
 logging.basicConfig(level=logging.WARNING)
+brblog = logging.getLogger(__name__)
+brblog.setLevel(logging.WARNING)
 
 SCRIPT_NAME = "BRB Timer"
 SCRIPT_VERSION = 1.0
@@ -1113,6 +1115,12 @@ class TwitchEventPubClient:
 
 # =========================================================================
 class Events:
+    SHOW_TRANSITION_TYPE = 'slide_transition'
+    HIDE_TRANSITION_TYPE = 'slide_transition'
+    SHOW_TRANSITION_DIR = 'left'
+    HIDE_TRANSITION_DIR = 'right'
+    TRANSITION_DURATION_MS = 300
+
     source_name: str = DEFAULTS.TEXT_TIMER
     running: bool = False
     start_time: int = 0
@@ -1514,6 +1522,35 @@ class OBS:
     #----------------------------------------------------------------------
     @classmethod
     @contextlib.contextmanager
+    def source_create(
+        self,
+        source_type: str,
+        source_name: str,
+        settings = None, # obs_data_t
+    ): # yield obs_source_t
+        """
+        Yield a brand new source.
+        """
+        with self.data_yield(settings) if settings is not None else self.data() as settings:
+            try:
+                source = S.obs_source_create(
+                    source_type,
+                    source_name,
+                    settings,
+                    None,
+                )
+                if source is None:
+                    raise ValueError(f"Unable to create a new Source object.")
+
+                yield source
+
+            finally:
+                if source is not None:
+                    S.obs_source_release(source)
+
+    #----------------------------------------------------------------------
+    @classmethod
+    @contextlib.contextmanager
     def source_create_text(
         self,
         source_name: str,
@@ -1540,7 +1577,7 @@ class OBS:
             source_types = [source_type_id]
 
         # Import default text settings.
-        with self.text_settings(text) as settings:
+        with self.text_settings(text, font_size_px=144) as settings:
             # Check if the source type exists before trying to create the source.
             for source_id in source_types:
                 display_name = S.obs_source_get_display_name(source_id)
@@ -1796,6 +1833,21 @@ class OBS:
         finally:
             if data is not None:
                 S.obs_data_release(data)
+
+    #----------------------------------------------------------------------
+    @classmethod
+    @contextlib.contextmanager
+    def data_yield(
+        self,
+        data, # obs_data_t
+    ): # yield obs_data_t
+        """
+        Yield the passed data object. Does NOT release it.
+        """
+        try:
+            yield data
+        finally:
+            pass
 
     #----------------------------------------------------------------------
     @classmethod
