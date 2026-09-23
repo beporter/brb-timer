@@ -614,7 +614,6 @@ class TwitchEventPubClient:
         'user:read:chat',
         'user:write:chat',
         'user:bot',
-        'channel:bot',
     ]
 
     RECONNECT_DELAY: int = 5
