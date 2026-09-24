@@ -8,16 +8,26 @@ Exposes some chat commands for mods and chatters to use:
 - `!at MM:SS` - Chatters register a guess when the streamer will return.
 - `!back` - Mods can end an active `!brb` and sends a chat message stating the "winner".
 
-Demo video:
 
-<video src="https://beporter.github.io/brb-timer/BRBTimer_Demo.mp4" alt="BRB Timer for OBS demo video">
+## Usage
+
+Once you go live and start streaming, three new chat commands will be available:
+
+- `!brb` - **Only accessible to the broadcaster and mods.** Starts the count-up timer, shows it on-stream, and enables the `!at MM:SS` command.
+- `!at MM:SS` - Accessible to all chatters, including mods. Registers the user's guess for when the streamer will return. Nobody can guess more than once per !brb, since that'd allow people to cheat by constantly updating their guess.
+- `!back` - **Only accessible to the broadcaster and mods.** Ends the `!brb`, hides the on-screen timer (after a cooldown delay), and sends a chat message stating the "winner".
+    - The winner is the chat member who registered a guess closest to the count-up timer's final time... without going over-- [Price is Right](https://en.wikipedia.org/wiki/The_Price_Is_Right#One_Bid) rules.
+
+<!-- ![BRB Timer in action, in a Twitch chat channel](docs/brbtimer-chat-demo.png) -->
+
+<video src="https://beporter.github.io/brb-timer/BRBTimer_Demo.mp4"></video>
 
 
 ## Installation
 
 Setup video:
 
-<video src="https://beporter.github.io/brb-timer/BRBTimer_install_and_config.mp4" alt="installing and configuring BRB Timer for OBS">
+<video src="https://beporter.github.io/brb-timer/BRBTimer_install_and_config.mp4"></video>
 
 1. Download the <a download href="https://raw.githubusercontent.com/beporter/brb-timer/main/brb_timer.py">brb_timer.py</a> script to your computer running OBS. That's the only file required.
     ![download brb_timer.py from GitHub](docs/download-from-github.png)
@@ -65,7 +75,7 @@ The script requires minimal Twitch OAuth access to make API calls and to process
 
 ## Customization
 
-<video src="https://beporter.github.io/brb-timer/BRBTimer_Customize.mp4" alt="customizing the on-screen BRB Timer">
+<video src="https://beporter.github.io/brb-timer/BRBTimer_Customize.mp4"></video>
 
 The script will have also created a new text Source in your active OBS scene with some default display settings and transitions.
 
@@ -76,18 +86,6 @@ This script will show/hide and update the count-up timer in this text Source aut
 ![Source properties](docs/obs-tools-scripts-menu.png)
 
 :warning: The **name** of the timer source must remain unchanged in OBS, or this script will try to recreate a new one on next launch.
-
-
-## Usage
-
-Once you go live and start streaming, three new chat commands will be available:
-
-- `!brb` - **Only accessible to the broadcaster and mods.** Starts the count-up timer, shows it on-stream, and enables the `!at MM:SS` command.
-- `!at MM:SS` - Accessible to all chatters, including mods. Registers the user's guess for when the streamer will return. Nobody can guess more than once per !brb, since that'd allow people to cheat by constantly updating their guess.
-- `!back` - **Only accessible to the broadcaster and mods.** Ends the `!brb`, hides the on-screen timer (after a cooldown delay), and sends a chat message stating the "winner".
-    - The winner is the chat member who registered a guess closest to the count-up timer's final time... without going over-- [Price is Right](https://en.wikipedia.org/wiki/The_Price_Is_Right#One_Bid) rules.
-
-![BRB Timer in action, in a Twitch chat channel](docs/brbtimer-chat-demo.png)
 
 
 ## License
