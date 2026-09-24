@@ -87,6 +87,7 @@ Once you go live and start streaming, three new chat commands will be available:
 
 ![BRB Timer in action, in a Twitch chat channel](docs/brbtimer-chat-demo.png)
 
+
 ## License
 
 [MIT](/LICENSE.md)
