@@ -142,3 +142,28 @@
 
 - Size of the chop: `76px` tall.
 
+
+## Video compression
+
+[OpenScreen](https://getopenscreen.com/) was used to capture the screen recordings, but it produces pretty darn large mp4 files. They can be reduced approximately 10:1 with ffmpeg. Example command:
+
+```shell
+# Credit to https://ffmpeg.run/commands/compress-mp4 !!
+/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg \
+ -i "BRBTimer_install_and_config_4by3.mp4" \
+ -c:v libx264 \
+ -crf 23 \
+ -preset slow \
+ -an \
+ "compressed.mp4"
+```
+
+Breakdown:
+
+- `/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg` - Have to use the full path because this keg isn't symlinked into your $PATH.
+- `-i "BRBTimer_install_and_config_4by3.mp4` - Name the input file to process.
+- `-c:v libx264` - Encode the video using the h264 library.
+- `-crf 23` - Quality and size control. **Lower** values increase quality and file size.
+- `-preset slow` - Spend extra CPU during encoding to improve compression.
+- `-an` - Remove any included audio stream. (The videos are slient so there's no benefit to these tracks wasting any space, no matter how little.)
+- `"compressed.mp4"` - Name the output file.

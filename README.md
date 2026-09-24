@@ -10,14 +10,14 @@ Exposes some chat commands for mods and chatters to use:
 
 Demo video:
 
-![BRB Timer for OBS demo](https://beporter.github.io/brb-timer/brb-timer_demo.mp4)
+![BRB Timer for OBS demo](https://beporter.github.io/brb-timer/BRBTimer_Demo.mp4)
 
 
 ## Installation
 
 Setup video:
 
-![installing and configuring BRB Timer for OBS](https://beporter.github.io/brb-timer/brb-timer_install.mp4)
+![installing and configuring BRB Timer for OBS](https://beporter.github.io/brb-timer/BRBTimer_install_and_config.mp4)
 
 1. Download the <a download href="https://raw.githubusercontent.com/beporter/brb-timer/main/brb_timer.py">brb_timer.py</a> script to your computer running OBS. That's the only file required.
     ![download brb_timer.py from GitHub](docs/download-from-github.png)
@@ -65,7 +65,7 @@ The script requires minimal Twitch OAuth access to make API calls and to process
 
 ## Customization
 
-![customizing the on-screen BRB Timer](https://beporter.github.io/brb-timer/brb-timer_customize.mp4)
+![customizing the on-screen BRB Timer](https://beporter.github.io/brb-timer/BRBTimer_Customize.mp4)
 
 The script will have also created a new text Source in your active OBS scene with some default display settings and transitions.
 
