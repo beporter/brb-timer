@@ -94,7 +94,7 @@ class MESSAGES(metaclass=MessageMeta):
 
     # Reporting script state.
     ALREADY_RUNNING = (
-        f"{COMMANDS.BRB} is already running! "
+        f"A {COMMANDS.BRB} is already running! "
         f"Must use {COMMANDS.BACK} first."
     )
     NO_BRB = (

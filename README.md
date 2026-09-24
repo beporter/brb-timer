@@ -17,7 +17,7 @@ Demo video:
 
 Setup video:
 
-![installation and config of BRB Timer for OBS](https://beporter.github.io/brb-timer/brb-timer_install-config.mp4)
+![installing and configuring BRB Timer for OBS](https://beporter.github.io/brb-timer/brb-timer_install.mp4)
 
 1. Download the <a download href="https://raw.githubusercontent.com/beporter/brb-timer/main/brb_timer.py">brb_timer.py</a> script to your computer running OBS. That's the only file required.
     ![download brb_timer.py from GitHub](docs/download-from-github.png)
@@ -64,6 +64,8 @@ The script requires minimal Twitch OAuth access to make API calls and to process
 
 
 ## Customization
+
+![customizing the on-screen BRB Timer](https://beporter.github.io/brb-timer/brb-timer_customize.mp4)
 
 The script will have also created a new text Source in your active OBS scene with some default display settings and transitions.
 

@@ -134,11 +134,11 @@
 
 - All screenshots are of the UTM window itself from MacOS (which gives us nice alpha shadows, but shows the MacOS titlebar and stoplight controls.)
 
-- To remove the window chrome, the images are batch processed using [Acorn](https://flyingmeat.com/acorn/) and [Automator](https://support.apple.com/guide/automator/welcome/mac).
+- To remove the window chrome, the images are batch processed using ImageMagick's [-chop](https://usage.imagemagick.org/crop/#chop) command.
 
 - Outer screenshot dimension: `1836px` wide x `2272px` tall (at 144 DPI).
 
 - Position of MacOS window chrome: `0px` right x `1684px` up.
 
-- Size of the crop: `76px` tall x `2272px` across.
+- Size of the chop: `76px` tall.
 
