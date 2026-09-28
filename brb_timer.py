@@ -27,7 +27,7 @@ from urllib import error, parse, request
 
 # =========================================================================
 SCRIPT_NAME = "BRB Timer"
-SCRIPT_VERSION = 1.0
+SCRIPT_VERSION = 1.1
 LOG_LEVEL = logging.DEBUG # Standard python log levels. Ref: https://docs.python.org/3.12/library/logging.html#logging-levels
 
 logging.basicConfig()
@@ -1176,62 +1176,63 @@ class Events:
             return False
 
         # Create the text source for the timer display
-        with OBS.source_create_text(
-            source_name,
-            text,
-            text_source_id,
-        ) as source:
+        with OBS.source_create_text(source_name, text) as source, \
+        OBS.scene_current() as scene:
             OBS.source_save(source)
+
+            if scene is None:
+                OBS.error("Current frontend source is not an OBS scene.")
+                return False
 
             # Add source to scene.
             # Ref: https://github.com/obsproject/obs-studio/blob/32.0.4/libobs/obs.h#L153
-            with OBS.scene_current() as scene:
-                if scene is None:
-                    OBS.error("Current frontend source is not an OBS scene.")
+            with OBS.scene_add(scene, source) as sceneitem:
+                if sceneitem is None:
+                    OBS.error(
+                        f"Could not add source '{source_name}' to current scene.",
+                    )
                     return False
 
-                # Add transitions to scene item.
-                with OBS.scene_add(scene, source) as sceneitem:
-                    if sceneitem is None:
-                        OBS.error(
-                            f"Could not add source '{source_name}' to current scene.",
-                        )
-                        return False
+                # Set starting position.
+                OBS.sceneitem_position_set(
+                    sceneitem,
+                    # These constants don't work for some reason.
+                    #S.OBS_ALIGN_RIGHT | S.OBS_ALIGN_TOP,
+                    ((1 << 1) | (1 << 2))
+                )
 
-                    OBS.sceneitem_position_set(
+                # Add transitions to scene item.
+                with OBS.transition_source_create(
+                    DEFAULTS.TRANSITION_SHOW,
+                    self.SHOW_TRANSITION_TYPE,
+                    'show',
+                    self.SHOW_TRANSITION_DIR,
+                ) as show_trans:
+                    OBS.source_save(show_trans)
+                    OBS.sceneitem_add_transition(
                         sceneitem,
-                        # These constants don't work for some reason.
-                        #S.OBS_ALIGN_RIGHT | S.OBS_ALIGN_TOP,
-                        ((1 << 1) | (1 << 2))
+                        show_trans,
+                        'show',
+                        self.TRANSITION_DURATION_MS,
                     )
 
-                    with OBS.transition_source_create(
-                        DEFAULTS.TRANSITION_SHOW,
-                        self.SHOW_TRANSITION_TYPE,
-                        'show',
-                        self.SHOW_TRANSITION_DIR,
-                    ) as show_trans:
-                        OBS.source_save(show_trans)
-                        OBS.sceneitem_add_transition(
-                            sceneitem,
-                            show_trans,
-                            'show',
-                            self.TRANSITION_DURATION_MS,
-                        )
-
-                    with OBS.transition_source_create(
-                        DEFAULTS.TRANSITION_HIDE,
-                        self.HIDE_TRANSITION_TYPE,
+                with OBS.transition_source_create(
+                    DEFAULTS.TRANSITION_HIDE,
+                    self.HIDE_TRANSITION_TYPE,
+                    'hide',
+                    self.HIDE_TRANSITION_DIR,
+                ) as hide_trans:
+                    OBS.source_save(hide_trans)
+                    OBS.sceneitem_add_transition(
+                        sceneitem,
+                        hide_trans,
                         'hide',
-                        self.HIDE_TRANSITION_DIR,
-                    ) as hide_trans:
-                        OBS.source_save(hide_trans)
-                        OBS.sceneitem_add_transition(
-                            sceneitem,
-                            hide_trans,
-                            'hide',
-                            self.TRANSITION_DURATION_MS,
-                        )
+                        self.TRANSITION_DURATION_MS,
+                    )
+
+        OBS.info(
+            f"Created new text source named '{source_name}' in current scene."
+        )
 
         return True
 
