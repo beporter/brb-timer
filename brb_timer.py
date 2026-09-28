@@ -7,6 +7,7 @@ import base64
 import contextlib
 from dataclasses import dataclass
 import datetime
+import functools
 import hashlib
 import http
 import inspect
@@ -24,6 +25,18 @@ import time
 from typing import Callable, Dict
 from urllib import error, parse, request
 
+# =========================================================================
+SCRIPT_NAME = "BRB Timer"
+SCRIPT_VERSION = 1.0
+LOG_LEVEL = logging.DEBUG # Standard python log levels. Ref: https://docs.python.org/3.12/library/logging.html#logging-levels
+
+logging.basicConfig()
+logging.getLogger().setLevel(LOG_LEVEL)
+brblog = logging.getLogger(__name__)
+brblog.setLevel(LOG_LEVEL)
+
+
+# =========================================================================
 try:
     import obspython as S # type: ignore
 except ImportError:
@@ -37,14 +50,8 @@ except ImportError:
     S = Mock()
     S.script_log = lambda _lvl, msg: print(msg)
 
-    logging.debug('obs module unavailable. Replaced with a mock.')
+    logging.warning('obspython module unavailable. Replaced with a mock.')
 
-logging.basicConfig(level=logging.WARNING)
-brblog = logging.getLogger(__name__)
-brblog.setLevel(logging.WARNING)
-
-SCRIPT_NAME = "BRB Timer"
-SCRIPT_VERSION = 1.0
 
 # =========================================================================
 class DEFAULTS:
@@ -636,10 +643,13 @@ class TwitchEventPubClient:
         self.stop_event: threading.Event = threading.Event()
 
         self.client_id: str = self.APP_CLIENT_ID
+        self.username: str = ''
         self.bot_user_id: int = None # ID of bot connecting to channel.
-        self.channel_user_id = None # ID of channel's owner.
+        self.channel_user_id: int = None # ID of channel's owner.
 
         self.keepalive_timeout: int = 10
+
+        self.last_sent: str = ''
 
     #----------------------------------------------------------------------
     def start(self) -> None:
@@ -723,6 +733,8 @@ class TwitchEventPubClient:
                     "Twitch rejected chat message: "
                     f"{data.get('drop_reason')!r}"
                 )
+
+            self.last_sent = message
 
     #----------------------------------------------------------------------
     def _receive_loop_thread(self) -> None:
@@ -818,6 +830,7 @@ class TwitchEventPubClient:
         self.user = resp.get('login', '')
         self.client_id = resp.get('client_id', self.APP_CLIENT_ID)
         self.expires_in = resp.get('expires_in', None), # int seconds
+        self.username = resp.get('login', '')
         self.channel_user_id = resp.get('user_id', '') # Channel is always the streamer's id...
         self.bot_user_id = self.channel_user_id # ...posting as themselves.
 
@@ -1079,7 +1092,7 @@ class TwitchEventPubClient:
                 case _:
                     detail = e.reason
 
-        OBS.error(f"_api_request failure: {detail}")
+        OBS.error(f"Twitch API request failure: {detail}")
         return False
 
     #----------------------------------------------------------------------
@@ -1146,7 +1159,6 @@ class Events:
         self,
         source_name: str,
         text: str = "hello world",
-        text_source_id: str = None, # Differs by platform. See OBS.source_create_text
     ) -> bool:
         """
         If we were provided a source_name that doesn't exist in the
@@ -1231,6 +1243,11 @@ class Events:
         This router is only responsible for determining whether to
         respond to an event and routing it to a handler, or ignore it.
         """
+        global chat_client
+        # Don't respond to our own messages.
+        if message.message == chat_client.last_sent:
+            return
+
         match message.message.strip().split()[0]:
             case COMMANDS.BRB:
                 self.command_brb(message)
@@ -1250,7 +1267,7 @@ class Events:
         from a separate python thread (such as the irc client).
         """
         if self.hide_time > 0 and int(time.time()) > self.hide_time:
-            OBS.debug('hide_time reached, hiding on-screen text')
+            OBS.info('Timer hide_time reached, hiding on-screen text.')
             OBS.sceneitem_set_visible_by_name(self.source_name, False)
             self.hide_time = 0
             return
@@ -1416,7 +1433,7 @@ class Events:
 
         existing_guess = self.has_guess(msg.username)
         if existing_guess:
-            OBS.debug(f"User {msg.username} already has a guess registered: {existing_guess}")
+            OBS.info(f"User {msg.username} already has a guess registered: {existing_guess}")
             self.send_chat(MESSAGES.ALREADY_GUESSED(
                 user=msg.username,
                 guess=DT.strfdelta(existing_guess),
@@ -1440,7 +1457,7 @@ class Events:
         """
         global chat_client
 
-        OBS.info("Handling !back.")
+        OBS.debug("Handling !back.")
         # Validate command was sent by broadcaster or nod.
         if not (msg.is_mod or msg.is_broadcaster):
             OBS.info("Only mods can run !back.")
@@ -1448,13 +1465,13 @@ class Events:
             return
 
         if not self.running:
-            OBS.debug("No brb running.")
+            OBS.info("No brb running.")
             self.send_chat(MESSAGES.NO_BRB)
             return
 
         # Disallow further guessing.
         if self.running:
-            OBS.debug("Stopping guesses.")
+            OBS.info("Stopping guesses.")
             self.guess_end(self.auto_hide_secs)
 
         # Announce the winner.
@@ -1469,7 +1486,7 @@ class Events:
                 diff=DT.strfdelta(actual_secs - guess_secs),
             ))
         else:
-            OBS.debug("No (valid) guesses, so no winner.")
+            OBS.info("No (valid) guesses, so no winner.")
             self.send_chat(MESSAGES.BRB_FINISHED_NO_GUESSES(
                 streamer=chat_client.user,
                 time=DT.strfdelta(actual_secs),
@@ -1587,7 +1604,7 @@ class OBS:
                 # Return the first successfully created text source.
                 with self.source_create(source_id, source_name, settings) as source:
                     if source is not None:
-                        self.info(
+                        self.debug(
                             f"Using text source type '%s' (%s)."
                                 % (display_name, source_id),
                             )
@@ -1605,7 +1622,7 @@ class OBS:
             si = S.obs_scene_find_source(scene, source_name) # Don't release unless an explicit ref was saved.
             if si is not None:
                 if S.obs_sceneitem_visible(si) is not visible:
-                    self.debug(f"{'showing' if visible else 'hiding'} sceneitem.")
+                    self.debug(f"{'showing' if visible else 'hiding'} sceneitem {source_name}.")
                     S.obs_sceneitem_set_visible(si, visible)
                 #S.obs_sceneitem_release(si) # DON'T release.
 
@@ -1686,7 +1703,7 @@ class OBS:
 
         finally:
             if sceneitem is not None:
-                S.obs_sceneitem_release(sceneitem)
+                pass #S.obs_sceneitem_release(sceneitem)
 
     #----------------------------------------------------------------------
     @classmethod
@@ -1895,7 +1912,46 @@ class OBS:
         # Dig into the frame details to get the fully qualified method name.
         calling_method = callers_caller_frameinfo.frame.f_code.co_qualname
 
-        S.script_log(level, f"[{calling_method}] {msg}")
+        # Only log if the message is at or below the configured limit.
+        if self._should_log(level):
+            S.script_log(self._log_level_map(level), f"[{calling_method}] {msg}")
+
+    #----------------------------------------------------------------------
+    @classmethod
+    def _log_level_map(self, level: int) -> int:
+        """
+        Converts a standard python log level to an OBS logging level.
+
+        Also accepts OBS levels and passes them through.
+        """
+        mappings = {
+            logging.CRITICAL: S.LOG_ERROR,
+            logging.ERROR: S.LOG_ERROR,
+            logging.WARNING: S.LOG_WARNING,
+            logging.INFO: S.LOG_INFO,
+            logging.DEBUG: S.LOG_DEBUG,
+            logging.NOTSET: S.LOG_DEBUG,
+
+            S.LOG_ERROR: S.LOG_ERROR,
+            S.LOG_WARNING: S.LOG_WARNING,
+            S.LOG_INFO: S.LOG_INFO,
+            S.LOG_DEBUG: S.LOG_DEBUG,
+        }
+
+        return mappings[level]
+
+    #----------------------------------------------------------------------
+    @classmethod
+    @functools.cache
+    def _should_log(self, level: int) -> bool:
+        global LOG_LEVEL
+        # Order matters! (least chatty --> most chatty)
+        ordered_levels = (S.LOG_ERROR, S.LOG_WARNING, S.LOG_INFO, S.LOG_DEBUG)
+
+        max_level = self._log_level_map(LOG_LEVEL)
+        allowed_levels = ordered_levels[0:ordered_levels.index(max_level)]
+
+        return self._log_level_map(level) in allowed_levels
 
 
 ###########################################################################
@@ -1935,7 +1991,7 @@ def script_description() -> str:
             <tr>
                 <td {cell_style} align="center">{mod_svg}</td>
                 <td {cell_style}><code>{COMMANDS.BRB}</code></td>
-                <td {cell_style}>Start the on-screen timer and allow guessing.</td>
+                <td {cell_style}>Start on-screen timer and allow guessing.</td>
             </tr>
             <tr>
                 <td {cell_style} align="center">&nbsp;</td>
@@ -1969,7 +2025,7 @@ def script_defaults(
     """
     S.obs_data_set_default_int(
         settings,
-        "auto_hide_secs",
+        'auto_hide_secs',
         DEFAULTS.AUTO_HIDE_SECS,
     )
 
@@ -1985,6 +2041,7 @@ def script_properties():
     the button in this method and let an eventual modified callback
     unhide it when conditions are met.
     """
+    OBS.debug('script_properties starting.')
     props = S.obs_properties_create()
 
     # Connect Twitch button
@@ -2000,8 +2057,7 @@ def script_properties():
         b,
         (
             'Open a browser window to obtain '
-            'a Twitch API token for this script to use. '
-            'Paste it below.'
+            'a Twitch API token for this script to use.'
         ),
     )
 
@@ -2012,7 +2068,28 @@ def script_properties():
         'Twitch OAuth Token',
         S.OBS_TEXT_PASSWORD,
     )
-    # S.obs_property_set_modified_callback(t, dispatch(e.on_token_modified))
+    S.obs_property_set_long_description(
+        t,
+        'Paste the Twitch auth token from the clicking the button above.',
+    )
+
+    s = S.obs_properties_add_int(
+        props,
+        "auto_hide_secs",
+        "Auto-hide Delay",
+        0,       # min
+        60 * 30, # max (30 mins)
+        1,       # step
+    )
+    S.obs_property_int_set_suffix(s, ' secs')
+    S.obs_property_set_long_description(
+        s,
+        (
+            'Number of seconds until the script hides the stopped '
+            'timer after the streamer returns from being AFK.'
+        ),
+    )
+
 
     OBS.debug('script_properties complete.')
     return props
@@ -2070,6 +2147,8 @@ def script_update(settings):
 #--------------------------------------------------------------------------
 def script_unload():
     global chat_client
+
+    OBS.debug('script_unload starting.')
 
     S.timer_remove(e.ticker)
 
