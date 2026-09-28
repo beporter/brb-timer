@@ -28,7 +28,7 @@ from urllib import error, parse, request
 # =========================================================================
 SCRIPT_NAME = "BRB Timer"
 SCRIPT_VERSION = 1.1
-LOG_LEVEL = logging.DEBUG # Standard python log levels. Ref: https://docs.python.org/3.12/library/logging.html#logging-levels
+LOG_LEVEL = logging.INFO # Standard python log levels. Ref: https://docs.python.org/3.12/library/logging.html#logging-levels
 
 logging.basicConfig()
 logging.getLogger().setLevel(LOG_LEVEL)
@@ -643,6 +643,7 @@ class TwitchEventPubClient:
         self.stop_event: threading.Event = threading.Event()
 
         self.client_id: str = self.APP_CLIENT_ID
+        self.expires_at: int = 0
         self.username: str = ''
         self.bot_user_id: int = None # ID of bot connecting to channel.
         self.channel_user_id: int = None # ID of channel's owner.
@@ -829,7 +830,7 @@ class TwitchEventPubClient:
 
         self.user = resp.get('login', '')
         self.client_id = resp.get('client_id', self.APP_CLIENT_ID)
-        self.expires_in = resp.get('expires_in', None), # int seconds
+        self.expires_at = int(time.time()) + int(resp.get('expires_in', 0)) # int seconds
         self.username = resp.get('login', '')
         self.channel_user_id = resp.get('user_id', '') # Channel is always the streamer's id...
         self.bot_user_id = self.channel_user_id # ...posting as themselves.
@@ -1479,7 +1480,7 @@ class Events:
         (winner, guess_secs) = self.guess_winner()
         actual_secs = self.stop_time - self.start_time
         if winner:
-            OBS.info(f"!brb winner is: {winner}")
+            OBS.info(f"!brb winner is: {winner}.")
             self.send_chat(MESSAGES.BRB_FINISHED(
                 streamer=chat_client.user,
                 time=DT.strfdelta(actual_secs),
@@ -1493,6 +1494,7 @@ class Events:
                 time=DT.strfdelta(actual_secs),
             ))
 
+        OBS.info(f"Auto-hiding timer in {self.auto_hide_secs} seconds.")
         OBS.debug("!back handled.")
 
 
@@ -1915,7 +1917,7 @@ class OBS:
 
         # Only log if the message is at or below the configured limit.
         if self._should_log(level):
-            S.script_log(self._log_level_map(level), f"[{calling_method}] {msg}")
+            S.script_log(level, f"[{calling_method}] {msg}")
 
     #----------------------------------------------------------------------
     @classmethod
@@ -1950,9 +1952,9 @@ class OBS:
         ordered_levels = (S.LOG_ERROR, S.LOG_WARNING, S.LOG_INFO, S.LOG_DEBUG)
 
         max_level = self._log_level_map(LOG_LEVEL)
-        allowed_levels = ordered_levels[0:ordered_levels.index(max_level)]
+        allowed_levels = ordered_levels[0:ordered_levels.index(max_level)+1]
 
-        return self._log_level_map(level) in allowed_levels
+        return level in allowed_levels
 
 
 ###########################################################################
@@ -1960,6 +1962,12 @@ class OBS:
 
 e: Events = Events()
 chat_client: TwitchEventPubClient = None
+
+#--------------------------------------------------------------------------
+def token_expired() -> bool:
+    global chat_client
+    token_expires_at = getattr(chat_client, 'expires_at', 0)
+    return token_expires_at > 0 and time.time() >= token_expires_at
 
 
 ###########################################################################
@@ -2074,6 +2082,18 @@ def script_properties():
         'Paste the Twitch auth token from the clicking the button above.',
     )
 
+    # Token expiration warning.
+    i = S.obs_properties_add_text(
+        props,
+        'twitch_creds_expired',
+        'Twitch token has expired. Please obtain a fresh token.',
+        S.OBS_TEXT_INFO_WARNING,
+    )
+    S.obs_property_text_set_info_word_wrap(i, True)
+    S.obs_property_text_set_info_type(i, S.OBS_TEXT_INFO_NORMAL)
+    S.obs_property_set_visible(i, token_expired())
+
+    # Auto-hide seconds.
     s = S.obs_properties_add_int(
         props,
         "auto_hide_secs",
@@ -2090,7 +2110,6 @@ def script_properties():
             'timer after the streamer returns from being AFK.'
         ),
     )
-
 
     OBS.debug('script_properties complete.')
     return props
@@ -2138,10 +2157,18 @@ def script_update(settings):
             chat_client.close()
             chat_client = None
 
-    if len(e.token) > 0:
+    if (
+        len(e.token) > 0
+        and not token_expired()
+        and chat_client is None
+    ):
         OBS.debug('Starting new chat client.')
         chat_client = TwitchEventPubClient(e.token, e.on_chat)
         chat_client.start()
+
+    new_auto_hide = S.obs_data_get_int(settings, 'auto_hide_secs')
+    if new_auto_hide is not None:
+        e.auto_hide_secs = new_auto_hide
 
     OBS.debug('script_update complete.')
 
